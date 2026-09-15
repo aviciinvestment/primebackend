@@ -66,6 +66,7 @@ export const listUsers = async (_req: Request, res: Response) => {
         photoURL: u.photoURL,
         role: u.role,
         createdAt: u.createdAt,
+        mentorshipInterest: u.mentorshipInterest || null,
       })),
     });
   } catch (error: any) {

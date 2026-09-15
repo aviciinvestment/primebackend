@@ -85,3 +85,37 @@ export const getUser = async (req: Request, res: Response) => {
     res.status(500).json({ success: false, error: 'Failed to fetch user.' });
   }
 };
+
+// Record whether a user is interested in paid mentorship (the "coming soon"
+// page asks Yes/No). The answer surfaces on the admin user list.
+export const recordMentorshipInterest = async (req: Request, res: Response) => {
+  try {
+    const { uid, choice, source, opportunityTitle, opportunityUrl } = req.body || {};
+    if (!uid) return res.status(400).json({ success: false, error: 'uid is required.' });
+    if (choice !== 'yes' && choice !== 'no') {
+      return res.status(400).json({ success: false, error: 'choice must be "yes" or "no".' });
+    }
+
+    const user = await AppUser.findOneAndUpdate(
+      { uid: String(uid) },
+      {
+        $set: {
+          mentorshipInterest: {
+            choice,
+            source: source === 'opportunity' ? 'opportunity' : 'general',
+            opportunityTitle: String(opportunityTitle || ''),
+            opportunityUrl: String(opportunityUrl || ''),
+            answeredAt: new Date(),
+          },
+        },
+        $setOnInsert: { role: 'user' },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({ success: true, mentorshipInterest: user ? user.mentorshipInterest : null });
+  } catch (error: any) {
+    console.error('Failed to record mentorship interest:', error);
+    res.status(500).json({ success: false, error: 'Failed to record mentorship interest.' });
+  }
+};

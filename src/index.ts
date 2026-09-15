@@ -4,6 +4,7 @@ import cors from 'cors';
 import mongoose from 'mongoose';
 import cron from 'node-cron';
 import { runOpportunitySync } from './services/syncOpportunities';
+import { autoLaunchIfDue } from './controllers/launchController';
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -28,6 +29,7 @@ import applicationRoutes from './routes/applicationRoutes';
 import mentorshipRoutes from './routes/mentorshipRoutes';
 import userRoutes from './routes/userRoutes';
 import adminRoutes from './routes/adminRoutes';
+import launchRoutes from './routes/launchRoutes';
 
 // Basic health check endpoint
 app.get('/api/health', (req, res) => {
@@ -43,6 +45,7 @@ app.use('/api/applications', applicationRoutes);
 app.use('/api/mentorships', mentorshipRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/launch', launchRoutes);
 
 // Database connection
 const mongoUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/opportunity-radar';
@@ -77,16 +80,35 @@ const scheduleOpportunitySync = () => {
     .catch(error => console.error('[sync] Initial sync failed:', error));
 };
 
+// Auto-launch: if the admin never clicked "Launch" and the countdown has
+// elapsed, launch the app automatically.
+const scheduleLaunchCheck = () => {
+  cron.schedule('*/1 * * * *', async () => {
+    try {
+      const config = await autoLaunchIfDue();
+      if (config?.launched) {
+        console.log('[launch] App auto-launched (countdown elapsed).');
+      }
+    } catch (error) {
+      console.error('[launch] schedule check failed:', error);
+    }
+  });
+};
+
 mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 })
   .then(() => {
     console.log('Connected to MongoDB');
     scheduleOpportunitySync();
+    scheduleLaunchCheck();
   })
   .catch((error) => {
     console.error('MongoDB connection error. Running in mock mode.', error.message);
     console.log('Opportunity sync requires MongoDB — it will start once the database reconnects.');
     // Retry connecting + scheduling when the DB becomes available.
-    mongoose.connection.on('connected', scheduleOpportunitySync);
+    mongoose.connection.on('connected', () => {
+      scheduleOpportunitySync();
+      scheduleLaunchCheck();
+    });
   });
 
 

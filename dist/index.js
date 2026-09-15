@@ -24,9 +24,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 
 // src/index.ts
 var import_config = require("dotenv/config");
-var import_express18 = __toESM(require("express"));
+var import_express20 = __toESM(require("express"));
 var import_cors = __toESM(require("cors"));
-var import_mongoose11 = __toESM(require("mongoose"));
+var import_mongoose13 = __toESM(require("mongoose"));
 var import_node_cron = __toESM(require("node-cron"));
 
 // src/models/Opportunity.ts
@@ -847,11 +847,183 @@ var runOpportunitySync = async () => {
   };
 };
 
+// src/controllers/launchController.ts
+var import_express = require("express");
+
+// src/models/LaunchConfig.ts
+var import_mongoose2 = __toESM(require("mongoose"));
+var LaunchConfigSchema = new import_mongoose2.Schema(
+  {
+    launched: { type: Boolean, default: false },
+    launchedAt: { type: Date, default: null },
+    countdownMs: { type: Number, default: 5 * 24 * 60 * 60 * 1e3 },
+    deadline: { type: Date, default: null },
+    whatsappGroupUrl: { type: String, default: "" }
+  },
+  { timestamps: true }
+);
+var LaunchConfig_default = import_mongoose2.default.model("LaunchConfig", LaunchConfigSchema);
+
+// src/models/WaitlistEntry.ts
+var import_mongoose3 = __toESM(require("mongoose"));
+var WaitlistEntrySchema = new import_mongoose3.Schema(
+  {
+    email: { type: String, required: true, unique: true, index: true, trim: true, lowercase: true }
+  },
+  { timestamps: true }
+);
+var WaitlistEntry_default = import_mongoose3.default.model("WaitlistEntry", WaitlistEntrySchema);
+
+// src/controllers/launchController.ts
+var DAY_MS2 = 24 * 60 * 60 * 1e3;
+var DEFAULT_COUNTDOWN_MS = 5 * DAY_MS2;
+var WELCOME_WINDOW_MS = 2 * DAY_MS2;
+var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+var getConfig = async () => {
+  let config = await LaunchConfig_default.findOne();
+  if (!config) {
+    config = await LaunchConfig_default.create({
+      launched: false,
+      launchedAt: null,
+      countdownMs: DEFAULT_COUNTDOWN_MS,
+      deadline: new Date(Date.now() + DEFAULT_COUNTDOWN_MS),
+      whatsappGroupUrl: ""
+    });
+  } else if (!config.deadline) {
+    config.deadline = new Date(Date.now() + (config.countdownMs || DEFAULT_COUNTDOWN_MS));
+    await config.save();
+  }
+  return config;
+};
+var autoLaunchIfDue = async () => {
+  try {
+    const config = await getConfig();
+    if (!config.launched && config.deadline && new Date(config.deadline).getTime() <= Date.now()) {
+      config.launched = true;
+      config.launchedAt = /* @__PURE__ */ new Date();
+      await config.save();
+    }
+    return config;
+  } catch (error) {
+    console.error("autoLaunchIfDue failed:", error);
+    return null;
+  }
+};
+var toPublic = (config) => ({
+  launched: config.launched,
+  launchedAt: config.launchedAt,
+  welcomeUntil: config.launchedAt ? new Date(new Date(config.launchedAt).getTime() + WELCOME_WINDOW_MS) : null,
+  countdownMs: config.countdownMs,
+  deadline: config.deadline,
+  whatsappGroupUrl: config.whatsappGroupUrl
+});
+var getLaunchStatus = async (_req, res) => {
+  try {
+    await autoLaunchIfDue();
+    const config = await getConfig();
+    const waitlistCount = await WaitlistEntry_default.countDocuments();
+    res.json({ success: true, ...toPublic(config), waitlistCount });
+  } catch (error) {
+    console.error("Failed to get launch status:", error);
+    res.status(500).json({ success: false, error: "Failed to load launch status." });
+  }
+};
+var joinWaitlist = async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) {
+      return res.status(400).json({ success: false, error: "Please enter a valid email address." });
+    }
+    await WaitlistEntry_default.updateOne(
+      { email },
+      { $setOnInsert: { email } },
+      { upsert: true }
+    );
+    const config = await getConfig();
+    const waitlistCount = await WaitlistEntry_default.countDocuments();
+    res.json({
+      success: true,
+      waitlistCount,
+      whatsappGroupUrl: config.whatsappGroupUrl
+    });
+  } catch (error) {
+    console.error("Failed to join waitlist:", error);
+    res.status(500).json({ success: false, error: "Failed to join the waitlist." });
+  }
+};
+var getAdminLaunch = async (_req, res) => {
+  try {
+    await autoLaunchIfDue();
+    const config = await getConfig();
+    const entries = await WaitlistEntry_default.find().sort({ createdAt: -1 }).limit(500).lean();
+    res.json({
+      success: true,
+      ...toPublic(config),
+      waitlistCount: entries.length,
+      waitlist: entries.map((e) => ({ email: e.email, joinedAt: e.createdAt }))
+    });
+  } catch (error) {
+    console.error("Failed to load admin launch data:", error);
+    res.status(500).json({ success: false, error: "Failed to load launch data." });
+  }
+};
+var setLaunchState = async (req, res) => {
+  try {
+    const launched = req.body?.launched === true;
+    const config = await getConfig();
+    config.launched = launched;
+    config.launchedAt = launched ? /* @__PURE__ */ new Date() : null;
+    if (!launched) {
+      config.deadline = new Date(Date.now() + (config.countdownMs || DEFAULT_COUNTDOWN_MS));
+    }
+    await config.save();
+    res.json({ success: true, launched: config.launched, deadline: config.deadline });
+  } catch (error) {
+    console.error("Failed to set launch state:", error);
+    res.status(500).json({ success: false, error: "Failed to update launch state." });
+  }
+};
+var setLaunchTimer = async (req, res) => {
+  try {
+    const { days, countdownMs } = req.body || {};
+    let ms;
+    if (typeof countdownMs === "number" && countdownMs > 0) {
+      ms = countdownMs;
+    } else if (typeof days === "number" && days > 0) {
+      ms = days * DAY_MS2;
+    } else {
+      return res.status(400).json({ success: false, error: "Provide a positive countdownMs or days." });
+    }
+    const config = await getConfig();
+    config.countdownMs = ms;
+    if (!config.launched) {
+      config.deadline = new Date(Date.now() + ms);
+    }
+    await config.save();
+    res.json({ success: true, countdownMs: config.countdownMs, deadline: config.deadline });
+  } catch (error) {
+    console.error("Failed to set launch timer:", error);
+    res.status(500).json({ success: false, error: "Failed to update the launch timer." });
+  }
+};
+var setWhatsappGroup = async (req, res) => {
+  try {
+    const url = String(req.body?.url || "").trim();
+    const config = await getConfig();
+    config.whatsappGroupUrl = url;
+    await config.save();
+    res.json({ success: true, whatsappGroupUrl: config.whatsappGroupUrl });
+  } catch (error) {
+    console.error("Failed to set WhatsApp group:", error);
+    res.status(500).json({ success: false, error: "Failed to save the WhatsApp group link." });
+  }
+};
+
 // src/routes/opportunityRoutes.ts
-var import_express2 = __toESM(require("express"));
+var import_express3 = __toESM(require("express"));
 
 // src/controllers/opportunityController.ts
-var import_express = require("express");
+var import_express2 = require("express");
 var MIN_SEARCH_SCORE = parseFloat(process.env.SEMANTIC_MIN_SCORE || "0.15");
 var tokenize = (text) => new Set(
   text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t.length > 1)
@@ -962,22 +1134,22 @@ var getOpportunity = async (req, res) => {
 };
 
 // src/routes/opportunityRoutes.ts
-var router = import_express2.default.Router();
+var router = import_express3.default.Router();
 router.get("/", getOpportunities);
 router.get("/:id", getOpportunity);
 var opportunityRoutes_default = router;
 
 // src/routes/authRoutes.ts
-var import_express4 = __toESM(require("express"));
+var import_express5 = __toESM(require("express"));
 
 // src/controllers/authController.ts
-var import_express3 = require("express");
+var import_express4 = require("express");
 var import_bcrypt = __toESM(require("bcrypt"));
 var import_jsonwebtoken = __toESM(require("jsonwebtoken"));
 
 // src/models/User.ts
-var import_mongoose2 = __toESM(require("mongoose"));
-var UserSchema = new import_mongoose2.Schema(
+var import_mongoose4 = __toESM(require("mongoose"));
+var UserSchema = new import_mongoose4.Schema(
   {
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
@@ -987,7 +1159,7 @@ var UserSchema = new import_mongoose2.Schema(
   },
   { timestamps: true }
 );
-var User_default = import_mongoose2.default.model("User", UserSchema);
+var User_default = import_mongoose4.default.model("User", UserSchema);
 
 // src/controllers/authController.ts
 var registerUser = async (req, res) => {
@@ -1054,25 +1226,25 @@ var loginUser = async (req, res) => {
 };
 
 // src/routes/authRoutes.ts
-var router2 = import_express4.default.Router();
+var router2 = import_express5.default.Router();
 router2.post("/register", registerUser);
 router2.post("/login", loginUser);
 var authRoutes_default = router2;
 
 // src/routes/aiRoutes.ts
-var import_express6 = __toESM(require("express"));
+var import_express7 = __toESM(require("express"));
 var import_multer = __toESM(require("multer"));
 
 // src/controllers/aiController.ts
-var import_express5 = require("express");
-var import_mongoose6 = require("mongoose");
+var import_express6 = require("express");
+var import_mongoose8 = require("mongoose");
 var import_pdf_parse = require("pdf-parse");
 var import_pinecone2 = require("@pinecone-database/pinecone");
 var import_openai2 = __toESM(require("openai"));
 
 // src/models/Cv.ts
-var import_mongoose3 = __toESM(require("mongoose"));
-var CvSchema = new import_mongoose3.Schema(
+var import_mongoose5 = __toESM(require("mongoose"));
+var CvSchema = new import_mongoose5.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String },
@@ -1082,16 +1254,16 @@ var CvSchema = new import_mongoose3.Schema(
     fileData: { type: Buffer, required: true },
     text: { type: String },
     analysis: { type: String },
-    matchIds: [{ type: import_mongoose3.Schema.Types.ObjectId, ref: "Opportunity" }]
+    matchIds: [{ type: import_mongoose5.Schema.Types.ObjectId, ref: "Opportunity" }]
   },
   { timestamps: true }
 );
 CvSchema.index({ userId: 1, createdAt: -1 });
-var Cv_default = import_mongoose3.default.model("Cv", CvSchema);
+var Cv_default = import_mongoose5.default.model("Cv", CvSchema);
 
 // src/models/Mentorship.ts
-var import_mongoose4 = __toESM(require("mongoose"));
-var MentorshipSchema = new import_mongoose4.Schema(
+var import_mongoose6 = __toESM(require("mongoose"));
+var MentorshipSchema = new import_mongoose6.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String, trim: true, lowercase: true },
@@ -1113,11 +1285,11 @@ var MentorshipSchema = new import_mongoose4.Schema(
   },
   { timestamps: true }
 );
-var Mentorship_default = import_mongoose4.default.model("Mentorship", MentorshipSchema);
+var Mentorship_default = import_mongoose6.default.model("Mentorship", MentorshipSchema);
 
 // src/models/MentorshipComplaint.ts
-var import_mongoose5 = __toESM(require("mongoose"));
-var MentorshipComplaintSchema = new import_mongoose5.Schema(
+var import_mongoose7 = __toESM(require("mongoose"));
+var MentorshipComplaintSchema = new import_mongoose7.Schema(
   {
     ticket: { type: String, required: true, unique: true },
     userId: { type: String, required: true, index: true },
@@ -1140,7 +1312,7 @@ var MentorshipComplaintSchema = new import_mongoose5.Schema(
   },
   { timestamps: true }
 );
-var MentorshipComplaint_default = import_mongoose5.default.model("MentorshipComplaint", MentorshipComplaintSchema);
+var MentorshipComplaint_default = import_mongoose7.default.model("MentorshipComplaint", MentorshipComplaintSchema);
 
 // src/controllers/aiController.ts
 var pinecone2 = new import_pinecone2.Pinecone({ apiKey: process.env.PINECONE_API_KEY });
@@ -1683,7 +1855,7 @@ var downloadCV = async (req, res) => {
       res.status(400).json({ success: false, message: "userId is required." });
       return;
     }
-    if (!(0, import_mongoose6.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -1709,7 +1881,7 @@ var deleteCV = async (req, res) => {
       res.status(400).json({ success: false, message: "userId is required." });
       return;
     }
-    if (!(0, import_mongoose6.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -1732,7 +1904,7 @@ var deleteCV = async (req, res) => {
 };
 
 // src/routes/aiRoutes.ts
-var router3 = import_express6.default.Router();
+var router3 = import_express7.default.Router();
 var storage = import_multer.default.memoryStorage();
 var upload = (0, import_multer.default)({
   storage,
@@ -1754,14 +1926,14 @@ router3.post("/chat", chatWithAI);
 var aiRoutes_default = router3;
 
 // src/routes/mentorRoutes.ts
-var import_express8 = __toESM(require("express"));
+var import_express9 = __toESM(require("express"));
 
 // src/controllers/mentorController.ts
-var import_express7 = require("express");
+var import_express8 = require("express");
 
 // src/models/Mentor.ts
-var import_mongoose7 = __toESM(require("mongoose"));
-var MentorSchema = new import_mongoose7.Schema(
+var import_mongoose9 = __toESM(require("mongoose"));
+var MentorSchema = new import_mongoose9.Schema(
   {
     userId: { type: String, required: true, unique: true, index: true },
     name: { type: String },
@@ -1773,7 +1945,7 @@ var MentorSchema = new import_mongoose7.Schema(
   },
   { timestamps: true }
 );
-var Mentor_default = import_mongoose7.default.model("Mentor", MentorSchema);
+var Mentor_default = import_mongoose9.default.model("Mentor", MentorSchema);
 
 // src/controllers/mentorController.ts
 var MENTOR_CUT = 0.9;
@@ -1900,15 +2072,15 @@ var getMentorDashboard = async (req, res) => {
 };
 
 // src/routes/mentorRoutes.ts
-var router4 = import_express8.default.Router();
+var router4 = import_express9.default.Router();
 router4.post("/register", registerMentor);
 router4.get("/profile", getMentorProfile);
 router4.get("/dashboard", getMentorDashboard);
 var mentorRoutes_default = router4;
 
 // src/routes/syncRoutes.ts
-var import_express9 = __toESM(require("express"));
-var router5 = import_express9.default.Router();
+var import_express10 = __toESM(require("express"));
+var router5 = import_express10.default.Router();
 router5.post("/run", async (_req, res) => {
   try {
     const result = await runOpportunitySync();
@@ -1921,17 +2093,17 @@ router5.post("/run", async (_req, res) => {
 var syncRoutes_default = router5;
 
 // src/routes/applicationRoutes.ts
-var import_express11 = __toESM(require("express"));
+var import_express12 = __toESM(require("express"));
 
 // src/controllers/applicationController.ts
-var import_express10 = require("express");
+var import_express11 = require("express");
 
 // src/models/Application.ts
-var import_mongoose8 = __toESM(require("mongoose"));
-var ApplicationSchema = new import_mongoose8.Schema(
+var import_mongoose10 = __toESM(require("mongoose"));
+var ApplicationSchema = new import_mongoose10.Schema(
   {
     userId: { type: String, required: true, index: true },
-    opportunityId: { type: import_mongoose8.Schema.Types.ObjectId, ref: "Opportunity", required: true },
+    opportunityId: { type: import_mongoose10.Schema.Types.ObjectId, ref: "Opportunity", required: true },
     status: {
       type: String,
       enum: ["saved", "applied", "interview", "accepted", "rejected"],
@@ -1944,7 +2116,7 @@ var ApplicationSchema = new import_mongoose8.Schema(
   { timestamps: true }
 );
 ApplicationSchema.index({ opportunityId: 1, userId: 1 }, { unique: true });
-var Application_default = import_mongoose8.default.model("Application", ApplicationSchema);
+var Application_default = import_mongoose10.default.model("Application", ApplicationSchema);
 
 // src/controllers/applicationController.ts
 var VALID_STATUSES = ["saved", "applied", "interview", "accepted", "rejected"];
@@ -2027,16 +2199,16 @@ var upsertApplication = async (req, res) => {
 };
 
 // src/routes/applicationRoutes.ts
-var router6 = import_express11.default.Router();
+var router6 = import_express12.default.Router();
 router6.get("/", getApplications);
 router6.post("/", upsertApplication);
 var applicationRoutes_default = router6;
 
 // src/routes/mentorshipRoutes.ts
-var import_express13 = __toESM(require("express"));
+var import_express14 = __toESM(require("express"));
 
 // src/controllers/mentorshipController.ts
-var import_express12 = require("express");
+var import_express13 = require("express");
 var GUIDANCE_AMOUNT = parseInt(process.env.MENTORSHIP_FEE || "20000", 10) || 2e4;
 var GUIDANCE_CURRENCY = process.env.MENTORSHIP_CURRENCY || "NGN";
 var getMentorshipConfig = (_req, res) => {
@@ -2118,31 +2290,38 @@ var getMentorships = async (req, res) => {
 };
 
 // src/routes/mentorshipRoutes.ts
-var router7 = import_express13.default.Router();
+var router7 = import_express14.default.Router();
 router7.get("/config", getMentorshipConfig);
 router7.get("/", getMentorships);
 router7.post("/", createMentorshipRequest);
 var mentorshipRoutes_default = router7;
 
 // src/routes/userRoutes.ts
-var import_express15 = __toESM(require("express"));
+var import_express16 = __toESM(require("express"));
 
 // src/controllers/userController.ts
-var import_express14 = require("express");
+var import_express15 = require("express");
 
 // src/models/AppUser.ts
-var import_mongoose9 = __toESM(require("mongoose"));
-var AppUserSchema = new import_mongoose9.Schema(
+var import_mongoose11 = __toESM(require("mongoose"));
+var AppUserSchema = new import_mongoose11.Schema(
   {
     uid: { type: String, required: true, unique: true, index: true },
     email: { type: String, trim: true, lowercase: true },
     displayName: { type: String, trim: true },
     photoURL: { type: String },
-    role: { type: String, enum: ["user", "admin"], default: "user" }
+    role: { type: String, enum: ["user", "admin"], default: "user" },
+    mentorshipInterest: {
+      choice: { type: String, enum: ["yes", "no", null], default: null },
+      source: { type: String, enum: ["opportunity", "general"], default: "general" },
+      opportunityTitle: { type: String, default: "" },
+      opportunityUrl: { type: String, default: "" },
+      answeredAt: { type: Date }
+    }
   },
   { timestamps: true }
 );
-var AppUser_default = import_mongoose9.default.model("AppUser", AppUserSchema);
+var AppUser_default = import_mongoose11.default.model("AppUser", AppUserSchema);
 
 // src/controllers/userController.ts
 var ADMIN_UIDS = new Set(
@@ -2209,19 +2388,49 @@ var getUser = async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to fetch user." });
   }
 };
+var recordMentorshipInterest = async (req, res) => {
+  try {
+    const { uid, choice, source, opportunityTitle, opportunityUrl } = req.body || {};
+    if (!uid) return res.status(400).json({ success: false, error: "uid is required." });
+    if (choice !== "yes" && choice !== "no") {
+      return res.status(400).json({ success: false, error: 'choice must be "yes" or "no".' });
+    }
+    const user = await AppUser_default.findOneAndUpdate(
+      { uid: String(uid) },
+      {
+        $set: {
+          mentorshipInterest: {
+            choice,
+            source: source === "opportunity" ? "opportunity" : "general",
+            opportunityTitle: String(opportunityTitle || ""),
+            opportunityUrl: String(opportunityUrl || ""),
+            answeredAt: /* @__PURE__ */ new Date()
+          }
+        },
+        $setOnInsert: { role: "user" }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    res.json({ success: true, mentorshipInterest: user ? user.mentorshipInterest : null });
+  } catch (error) {
+    console.error("Failed to record mentorship interest:", error);
+    res.status(500).json({ success: false, error: "Failed to record mentorship interest." });
+  }
+};
 
 // src/routes/userRoutes.ts
-var router8 = import_express15.default.Router();
+var router8 = import_express16.default.Router();
 router8.post("/", syncUser);
 router8.get("/", getUser);
+router8.post("/mentorship-interest", recordMentorshipInterest);
 var userRoutes_default = router8;
 
 // src/routes/adminRoutes.ts
-var import_express17 = __toESM(require("express"));
+var import_express18 = __toESM(require("express"));
 
 // src/controllers/adminController.ts
-var import_express16 = require("express");
-var import_mongoose10 = require("mongoose");
+var import_express17 = require("express");
+var import_mongoose12 = require("mongoose");
 var PLATFORM_CUT = 0.1;
 var requireAdmin = async (req, res, next) => {
   try {
@@ -2276,7 +2485,8 @@ var listUsers = async (_req, res) => {
         displayName: u.displayName,
         photoURL: u.photoURL,
         role: u.role,
-        createdAt: u.createdAt
+        createdAt: u.createdAt,
+        mentorshipInterest: u.mentorshipInterest || null
       }))
     });
   } catch (error) {
@@ -2381,7 +2591,7 @@ var listComplaints = async (req, res) => {
 var resolveComplaint = async (req, res) => {
   try {
     const { id } = req.params;
-    if (!(0, import_mongoose10.isValidObjectId)(id)) {
+    if (!(0, import_mongoose12.isValidObjectId)(id)) {
       return res.status(400).json({ success: false, error: "Invalid complaint id." });
     }
     const complaint = await MentorshipComplaint_default.findByIdAndUpdate(
@@ -2425,20 +2635,31 @@ var reviewMentorApplication = async (req, res) => {
 };
 
 // src/routes/adminRoutes.ts
-var router9 = import_express17.default.Router();
+var router9 = import_express18.default.Router();
 router9.use(requireAdmin);
 router9.get("/overview", getOverview);
 router9.get("/users", listUsers);
 router9.get("/mentors", listMentors);
 router9.get("/mentees", listMentees);
 router9.get("/complaints", listComplaints);
+router9.get("/launch", getAdminLaunch);
+router9.post("/launch/state", setLaunchState);
+router9.post("/launch/timer", setLaunchTimer);
+router9.post("/launch/whatsapp", setWhatsappGroup);
 router9.post("/users/:uid/promote", promoteUser);
 router9.post("/mentors/:uid/:action", reviewMentorApplication);
 router9.post("/complaints/:id/resolve", resolveComplaint);
 var adminRoutes_default = router9;
 
+// src/routes/launchRoutes.ts
+var import_express19 = __toESM(require("express"));
+var router10 = import_express19.default.Router();
+router10.get("/status", getLaunchStatus);
+router10.post("/waitlist", joinWaitlist);
+var launchRoutes_default = router10;
+
 // src/index.ts
-var app = (0, import_express18.default)();
+var app = (0, import_express20.default)();
 var port = process.env.PORT || 5e3;
 app.use(
   (0, import_cors.default)({
@@ -2447,7 +2668,7 @@ app.use(
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean) : true
   })
 );
-app.use(import_express18.default.json());
+app.use(import_express20.default.json());
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", message: "Opportunity Radar API is running" });
 });
@@ -2460,6 +2681,7 @@ app.use("/api/applications", applicationRoutes_default);
 app.use("/api/mentorships", mentorshipRoutes_default);
 app.use("/api/users", userRoutes_default);
 app.use("/api/admin", adminRoutes_default);
+app.use("/api/launch", launchRoutes_default);
 var mongoUri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/opportunity-radar";
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
@@ -2480,11 +2702,27 @@ var scheduleOpportunitySync = () => {
   console.log("[sync] Running initial opportunity sync at boot...");
   runOpportunitySync().then((result) => console.log("[sync] Initial sync complete:", JSON.stringify(result))).catch((error) => console.error("[sync] Initial sync failed:", error));
 };
-import_mongoose11.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 }).then(() => {
+var scheduleLaunchCheck = () => {
+  import_node_cron.default.schedule("*/1 * * * *", async () => {
+    try {
+      const config = await autoLaunchIfDue();
+      if (config?.launched) {
+        console.log("[launch] App auto-launched (countdown elapsed).");
+      }
+    } catch (error) {
+      console.error("[launch] schedule check failed:", error);
+    }
+  });
+};
+import_mongoose13.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 }).then(() => {
   console.log("Connected to MongoDB");
   scheduleOpportunitySync();
+  scheduleLaunchCheck();
 }).catch((error) => {
   console.error("MongoDB connection error. Running in mock mode.", error.message);
   console.log("Opportunity sync requires MongoDB \u2014 it will start once the database reconnects.");
-  import_mongoose11.default.connection.on("connected", scheduleOpportunitySync);
+  import_mongoose13.default.connection.on("connected", () => {
+    scheduleOpportunitySync();
+    scheduleLaunchCheck();
+  });
 });
