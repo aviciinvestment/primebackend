@@ -7,6 +7,18 @@ import Opportunity from '../models/Opportunity';
 import Cv from '../models/Cv';
 import Mentorship from '../models/Mentorship';
 import MentorshipComplaint from '../models/MentorshipComplaint';
+import { aiReplyCache } from '../lib/cache';
+import {
+  OFF_TOPIC_REFUSAL,
+  isOffTopic,
+  hasMentorshipIntent,
+  hasMentorshipComplaint,
+  makeTicket,
+  buildMentorshipReply,
+  buildComplaintReply,
+  serializeOpportunities,
+  buildSystemPrompt,
+} from '../../../shared/chatPolicies';
 
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY! });
 const INDEX_NAME = 'prime-opportunity-index';
@@ -28,74 +40,10 @@ const nvidiaChatClient = new OpenAI({
 // even if a malicious request is made.
 const CV_NAMESPACE_PREFIX = 'cvs-';
 
-// The exact refusal message used when a user asks something outside the
-// platform's scope. Must stay in sync with the system prompt string below.
-const OFF_TOPIC_REFUSAL =
-  "I don't have information on that in this jurisdiction. I can only help you with scholarships, internships, graduate trainee programmes, and fellowships on PrimeOpportunity.";
-
-// Deterministic guardrail: questions matching any of these clearly
-// out-of-scope patterns are refused without calling the LLM at all.
-const OFF_TOPIC_PATTERNS: RegExp[] = [
-  /hack (into|his|her|their|my)|crack (a )?password|break into (an?|the|my|someone'?s) (account|phone|computer|pc|system)|create (a )?virus|malware|phishing/i,
-  /medical advice|diagnos[ei] my|my sympto|prescription for|medication for|dosage|cure (my|for)|treat(ment)? for/i,
-  /my (boyfriend|girlfriend)|how to (flirt|date|get a girlfriend|get a boyfriend)|dating (tips|advice)|relationship (advice|problem)s?/i,
-  /pray (to|for)|bible verse|quran[^ ]* verse|sermon|religious (question|advice)|my church/i,
-  /political party|election (results|predictions)|vote for (a )?party/i,
-  /betting (tips|tricks)|sports betting|casino|jackpot|lottery (numbers|tickets)|bitcoin|cryptocurrenc|forex (trading)?|stock (tips|market predictions)|compound (a )?bomb/i,
-  /tell (me|us) a joke|make (me|us) laugh|roast me|movie (recommendation|suggestion|plot)|music (recommendation|suggestion)|game (cheats|walkthrough|hacks)|how to (win|beat) (fortnite|a game)/i,
-  /recipe for|how to (cook|bake|make) (a |an |some )?(meal|dish|cake|pasta|soup)/i,
-  /horoscop|tarot|astrolog|fortune tell(er|ing)?|dream meaning|palm reading|zodiac sign/i,
-  /solve (this|my) (math|physics|chemistry) (problem|question)|homework (help|answer)|write (an essay|a poem|a story|a song|a rap|a letter) (about|for)|essay about|poem about|translate (this |the )?(to|into) (french|spanish|german)/i,
-];
-
-const isOffTopic = (message: string): boolean => {
-  const text = ` ${message.toLowerCase()} `;
-  return OFF_TOPIC_PATTERNS.some(pattern => pattern.test(text));
-};
+// Deterministic guardrail + intent detection lives in shared/chatPolicies.ts so
+// the Cloudflare Worker and this server always agree. Do not duplicate it here.
 
 // ---- Chat action detection -----------------------------------------------
-// Two deterministic intents are handled WITHOUT an LLM call so their behaviour
-// never varies:
-//  1. Mentorship request  -> the client shows a link to the purchase page.
-//  2. Paid-but-no-mentor  -> the message is escalated to an admin with the
-//                            user's account details attached.
-
-const MENTORSHIP_INTENT_PATTERNS: RegExp[] = [
-  /\bneed (a |some |any )?(mentor|mentorship|guidance)\b/i,
-  /\bwant (a |to (get|buy|purchase|access|have|use|sign up for) |some )?(mentor|mentorship)\b/i,
-  /\bget (a |me )?(mentor|mentorship)\b/i,
-  /\b(how|where) (do|can|should) (i|me) (get|buy|purchase|access|find) (a )?(mentor|mentorship)\b/i,
-  /\b(pay|buy|purchase|paying|subscribe|sign up) (for |to |some )?(a )?(mentor|mentorship)\b/i,
-  /\b(mentor|mentorship) (me|to help me|for me,? please|please|guidance, please)\b/i,
-  /\b(am|i.?m|i am) (looking for|searching for|interested in) (a )?(mentor|mentorship)\b/i,
-  /\bmentorship\b/i,
-  /\bguide me through (an? )?(application|opportunity)/i,
-];
-
-const MENTORSHIP_COMPLAINT_PATTERNS: RegExp[] = [
-  /\bpaid\b[^.!?\n]{0,120}\b(?:but|yet|however|still)\b[^.!?\n]{0,80}\b(?:no|not|never|nothing|still|yet)\b[^.!?\n]{0,60}\b(?:mentor|guidance|assigned|matched|reviewed|contacted)\b/i,
-  /\b(?:no|not|never|nothing|still|yet)\b[^.!?\n]{0,80}\b(?:mentor|guidance|assigned|matched|reviewed)\b[^.!?\n]{0,80}\b(?:paid|payment|money|since)\b/i,
-  /\bh[ae]vent\b[^.!?\n]{0,40}\b(?:been )?(?:given|assigned|allocated|matched|received|gotten|seen)\b[^.!?\n]{0,50}\b(?:mentor|guidance)\b/i,
-  /\b(?:given|assigned|allocated|matched|attached)\b[^.!?\n]{0,40}\b(?:no|not|never)\b[^.!?\n]{0,40}\b(?:mentor|guidance)\b/i,
-  /\b(?:mentor|guidance|mentor is)\b[^.!?\n]{0,60}\b(?:not|no|never|still|yet|awaiting|pending)\b[^.!?\n]{0,60}\b(?:paid|payment|money)\b/i,
-  /\bnot given a mentor\b|\bstill (?:haven.?t|didn.?t) (?:gotten|received|seen) (?:a |my )?mentor\b|\bno mentor (yet|still|assigned)?\b/i,
-  /\b(?:yet to|not yet|haven.?t|h[ae]vent|still waiting|not received|no response|no feedback|no one)\b[^.!?\n]{0,100}\b(?:mentor|guidance|mentorship)\b/i,
-  /\bcomplaint\b[^.!?\n]{0,140}\b(?:mentor|mentorship|paid|payment)\b/i,
-  /\b(fraud|scam|ripped off|took my money)\b/i,
-];
-
-const hasMentorshipIntent = (message: string): boolean =>
-  MENTORSHIP_INTENT_PATTERNS.some(pattern => pattern.test(message));
-
-const hasMentorshipComplaint = (message: string): boolean =>
-  MENTORSHIP_COMPLAINT_PATTERNS.some(pattern => pattern.test(message));
-
-const makeTicket = (): string => {
-  const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
-  return `TKT-${Date.now().toString(36).toUpperCase()}-${suffix}`;
-};
-
-// "I paid but no mentor" -> store the report for admins and return a ticket.
 const handleMentorshipComplaint = async (message: string, userId: string, userEmail: string, userName: string): Promise<string> => {
   const ticket = makeTicket();
   try {
@@ -127,11 +75,7 @@ const handleMentorshipComplaint = async (message: string, userId: string, userEm
   } catch (err) {
     console.error('Failed to persist mentorship complaint:', err);
   }
-  return (
-    `I'm sorry to hear that — you should already have a mentor after paying.\n\n` +
-    `I've sent your message straight to our admin team along with your account details (email: ${userEmail || 'not provided'}). You don't need to do anything else; someone will follow up on your payment and assign a mentor as soon as possible.\n\n` +
-    `Your ticket number is **${ticket}** — you can reference it if you reach out again.`
-  );
+  return buildComplaintReply(userEmail, ticket);
 };
 
 const chunkText = (text: string, chunkSize = 1000, overlap = 150): string[] => {
@@ -264,8 +208,8 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
 
     const analysis = completion.choices[0].message.content;
 
-    // 5. Persist CV + matches to MongoDB (assigned to the authenticated user)
-    const userId = (req.body.userId as string) || '';
+// 5. Persist CV + matches to MongoDB (assigned to the authenticated user)
+    const userId = req.authUser!.uid;
     let savedCv: any = null;
     if (userId) {
       const cv = new Cv({
@@ -309,9 +253,17 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
   }
 };
 
+// ---- Chat ----------------------------------------------------------------
+
+// SSE frames sent to streaming clients:
+//   { type: 'delta', text }          -> incremental assistant text
+//   { type: 'done',  reply, action? }-> final reply (full text)
+//   { type: 'error', message }       -> terminal failure
+type SseFrame = Record<string, unknown>;
+
 export const chatWithAI = async (req: Request, res: Response) => {
   try {
-    const message = (req.body.message as string || '').trim();
+    const message = ((req.body?.message as string) || '').trim();
     if (!message) {
       res.status(400).json({ success: false, message: 'Message is required.' });
       return;
@@ -323,28 +275,59 @@ export const chatWithAI = async (req: Request, res: Response) => {
       .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
       .slice(-10);
 
-// The chat is only ever personalized with the requesting user's own CV.
+    // Identity comes from the verified Firebase token, never the request body.
     // userId scope is enforced by querying ONLY that user's private Pinecone namespace.
-    const userId = (req.body.userId as string || '').trim();
+    const userId = req.authUser!.uid;
+    const userEmail = ((req.body?.userEmail as string) || req.authUser!.email || '').trim();
+    const userName = ((req.body?.userName as string) || '').trim();
+
+    const stream = req.body?.stream === true;
+
+    // --- helpers for the two output modes (JSON vs SSE) ---
+    const startSse = () => {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+    };
+    const writeSse = (frame: SseFrame) => {
+      if (stream && !res.writableEnded) res.write(`data: ${JSON.stringify(frame)}\n\n`);
+    };
+    const respondDone = (reply: string, action?: { type: 'mentorship' }) => {
+      if (stream) {
+        writeSse({ type: 'done', reply, action: action || null });
+        res.end();
+      } else {
+        res.json({ success: true, reply, action: action || undefined });
+      }
+    };
+
+    // Streaming requests send SSE headers immediately so that EVERY reply path
+    // (cache hit, guardrails, mentorship, LLM stream) frames the response the
+    // same way — otherwise the client can't detect the event-stream and fails.
+    if (stream) {
+      startSse();
+    }
+
+    // --- in-memory cache: replay an identical recent request instantly ---
+    const cacheKey = `${userId}|${message}`;
+    const cached = aiReplyCache.get(cacheKey);
+    if (cached) {
+      return respondDone(cached.reply);
+    }
 
     // Hard guardrail: refuse clearly out-of-scope questions without an LLM call.
     if (isOffTopic(message)) {
-      res.json({ success: true, reply: OFF_TOPIC_REFUSAL });
-      return;
+      return respondDone(OFF_TOPIC_REFUSAL);
     }
 
     // Check complaints BEFORE the mentorship-intent catch-all, so a message like
     // "I paid for mentorship but no mentor yet" escalates to admins instead of
     // being treated as a new purchase request.
     if (hasMentorshipComplaint(message)) {
-      const reply = await handleMentorshipComplaint(
-        message,
-        userId,
-        (req.body.userEmail as string || '').trim(),
-        (req.body.userName as string || '').trim()
-      );
-      res.json({ success: true, reply });
-      return;
+      const reply = await handleMentorshipComplaint(message, userId, userEmail, userName);
+      return respondDone(reply);
     }
 
     // Mentorship request -> deterministic reply with an in-chat link to the
@@ -352,15 +335,10 @@ export const chatWithAI = async (req: Request, res: Response) => {
     if (hasMentorshipIntent(message)) {
       const fee = parseInt(process.env.MENTORSHIP_FEE || '20000', 10) || 20000;
       const currency = process.env.MENTORSHIP_CURRENCY || 'NGN';
-      res.json({
-        success: true,
-        action: { type: 'mentorship' },
-        reply:
-          'Great choice! Our **mentorship guidance** pairs you with an industry mentor who reviews your applications, coaches you, and boosts your chances of getting in.\n\n' +
-          `It costs **${currency} ${fee.toLocaleString()}** per opportunity and you can pay securely right from the page.\n\n` +
-          'Click the button below to get started.',
-      });
-      return;
+      return respondDone(
+        buildMentorshipReply(String(fee), currency),
+        { type: 'mentorship' }
+      );
     }
 
     // 1. Generate Embedding for the user's message
@@ -389,24 +367,11 @@ export const chatWithAI = async (req: Request, res: Response) => {
         .filter(Boolean);
 
       if (sortedOpportunities.length > 0) {
-        retrievedContext = sortedOpportunities.map((opp, idx) => {
-          const tags = opp!.tags && opp!.tags.length > 0 ? opp!.tags.join(', ') : 'None';
-          return `[${idx + 1}] ${opp!.title} at ${opp!.organization}
-  Type: ${opp!.opportunityType || 'Unknown'}
-  Category: ${opp!.category || 'N/A'}
-  Location: ${opp!.location || 'N/A'}
-  Field(s): ${opp!.eligibleFields ? opp!.eligibleFields.join(', ') : 'N/A'}
-  Eligibility: ${opp!.eligibleEducationLevels ? opp!.eligibleEducationLevels.join(', ') : (opp!.targetAudience ? opp!.targetAudience.join(', ') : 'N/A')}
-  Deadline: ${opp!.deadline || 'Not specified'}
-  Status: ${opp!.status || 'Unknown'}
-  Tags: ${tags}
-  Description: ${opp!.description || 'N/A'}
-  More info: ${opp!.officialUrl || 'N/A'}`;
-        }).join('\n\n');
+        retrievedContext = serializeOpportunities(sortedOpportunities);
       }
     }
 
-// 4. Retrieve the requesting user's OWN CV from their private namespace
+    // 4. Retrieve the requesting user's OWN CV from their private namespace
     //    (only ever this user's vectors — never another user's)
     let userCvContext = '';
     if (userId) {
@@ -458,59 +423,69 @@ export const chatWithAI = async (req: Request, res: Response) => {
     }
 
     // 5. Build system prompt (RAG instructions)
-    const systemPrompt = `You are PrimeOpportunity AI, a friendly and knowledgeable assistant for PrimeOpportunity — a platform that helps Nigerian students and early-career professionals discover tailored scholarships, internships, graduate trainee programmes, and fellowships.
+    const systemPrompt = buildSystemPrompt({ userCvContext, retrievedContext });
 
-ABOUT THE PLATFORM:
-- The site offers a searchable, filterable feed of opportunities (Scholarship, Internship, Graduate Trainee, Fellowship).
-- Users can filter by Opportunity Type and Education Level (Undergraduate, Final-Year, Recent Graduate, Postgraduate).
-- Logged-in users can upload their CV (PDF) and the AI analyzes their profile to find perfect matches, then filter the feed by "CV Match".
-- Opportunities include details like organization, category, location, deadline, eligibility, funding, and official application links.
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: systemPrompt },
+      ...history,
+      { role: 'user', content: message },
+    ];
 
-YOUR JOB:
-Using the RETRIEVED OPPORTUNITIES and the USER'S OWN CV PROFILE sections below when relevant, answer the user's question accurately and helpfully. Follow these rules:
-1. When the user asks about specific opportunities (e.g. "internships in Lagos", "scholarships for engineering"), prioritize the retrieved opportunities and clearly list the most relevant ones with their organization, deadline, and a link to apply.
-2. When the user asks personalized questions ("what internships fit my CV?", "summarize my CV", "what are my strengths?"), use the USER'S OWN CV PROFILE to give tailored advice.
-3. When answering, cite the opportunity title and organization so the user can verify.
-4. Use a hyperlink markdown format for official links, e.g. [Apply here](https://example.com).
-5. Do NOT invent or hallucinate opportunities that are not in the retrieved list. If nothing relevant was retrieved, say so and give general advice instead.
-6. Keep answers concise (under ~250 words), well-structured with bullet points where helpful. Respond in plain markdown.
-7. If the user asks about logging in, uploading a CV, filters, or how the site works, explain those features.
+    // Abort the LLM stream if the client disconnects mid-response.
+    const abort = new AbortController();
+    req.on('close', () => abort.abort());
 
-PRIVACY RULES (STRICT):
-- The USER'S OWN CV PROFILE belongs solely to the current user. You must NEVER claim to know the details, CV, or personal information of any other user.
-- Never reveal, repeat, or export raw CV information in a way that could be shared with others; summarize it only for the user who owns it.
-- If asked about another person's CV or data, politely decline.
+    if (stream) {
+      const completion = await nvidiaChatClient.chat.completions.create({
+        model: 'openai/gpt-oss-20b',
+        messages,
+        temperature: 0.6,
+        top_p: 0.95,
+        max_tokens: 700,
+        stream: true,
+        signal: abort.signal,
+      });
 
-SCOPE GUARDRAIL (STRICT — NEVER BREAK):
-- You may ONLY answer questions related to PrimeOpportunity and its content: discovering and applying for scholarships, internships, graduate trainee programmes, and fellowships for Nigerian students and early-career professionals; platform features (search, filters, sort, CV upload, CV Match, login, account); and personalized advice based on the user's OWN CV so long as it stays relevant to those opportunities.
-- If the user asks about anything outside that scope — general knowledge, schoolwork, medical, legal, financial/investment, political, religious, relationship, entertainment, recipes, sports, tech/coding, current events, or ANY topic unrelated to the platform — you MUST NOT answer it or add any extra detail.
-- In that case, reply with EXACTLY this message and nothing else: "${OFF_TOPIC_REFUSAL}"
-- When in doubt, refuse with that exact message. Never improvise an answer outside the platform's scope.
-
-USER'S OWN CV PROFILE:
-${userCvContext || 'The current user has not uploaded a CV yet (or none is vectorized). Do not claim you can see their CV.'}
-
-RETRIEVED OPPORTUNITIES:
-${retrievedContext}`;
+      let reply = '';
+      for await (const chunk of completion) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          reply += delta;
+          writeSse({ type: 'delta', text: delta });
+        }
+      }
+      if (!reply.trim()) {
+        reply = 'Sorry, I could not generate a response. Please try again.';
+      }
+      aiReplyCache.set(cacheKey, { reply });
+      writeSse({ type: 'done', reply });
+      res.end();
+      return;
+    }
 
     const completion = await nvidiaChatClient.chat.completions.create({
       model: 'openai/gpt-oss-20b',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...history,
-        { role: 'user', content: message },
-      ],
+      messages,
       temperature: 0.6,
       top_p: 0.95,
       max_tokens: 700,
       stream: false,
     });
 
-    const reply = completion.choices[0].message.content?.trim() || 'Sorry, I could not generate a response. Please try again.';
+    const reply =
+      completion.choices[0].message.content?.trim() ||
+      'Sorry, I could not generate a response. Please try again.';
 
+    aiReplyCache.set(cacheKey, { reply });
     res.json({ success: true, reply });
   } catch (error: any) {
     console.error('Error in AI chat:', error);
+    // If we already started an SSE stream, send a terminal error frame instead
+    // of a JSON 500 (the client would choke trying to parse it).
+    if (res.headersSent && !res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: 'Failed to process chat message.' })}\n\n`);
+      return res.end();
+    }
     res.status(500).json({
       success: false,
       message: 'Failed to process chat message.',
@@ -580,11 +555,7 @@ const extractCvHighlights = (cvText: string, analysis: string = '') => {
 
 export const getMyCVs = async (req: Request, res: Response) => {
   try {
-    const userId = (req.query.userId as string) || '';
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required.' });
-      return;
-    }
+    const userId = req.authUser!.uid;
 
     const cvs = await Cv.find({ userId })
       .sort({ createdAt: -1 })
@@ -615,11 +586,7 @@ export const getMyCVs = async (req: Request, res: Response) => {
 export const downloadCV = async (req: Request, res: Response) => {
   try {
     const { cvId } = req.params;
-    const userId = (req.query.userId as string) || '';
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required.' });
-      return;
-    }
+    const userId = req.authUser!.uid;
     if (!isValidObjectId(cvId)) {
       res.status(400).json({ success: false, message: 'Invalid CV id.' });
       return;
@@ -644,11 +611,7 @@ export const downloadCV = async (req: Request, res: Response) => {
 export const deleteCV = async (req: Request, res: Response) => {
   try {
     const { cvId } = req.params;
-    const userId = (req.body.userId as string) || '';
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required.' });
-      return;
-    }
+    const userId = req.authUser!.uid;
     if (!isValidObjectId(cvId)) {
       res.status(400).json({ success: false, message: 'Invalid CV id.' });
       return;
@@ -673,6 +636,61 @@ export const deleteCV = async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error deleting CV:', error);
     res.status(500).json({ success: false, message: 'Failed to delete CV.' });
+  }
+};
+
+// ---- Endpoints directly consumed by the Cloudflare Worker -------------------
+// The Worker owns the chat stream but has no Mongo access, so these two routes
+// serve the DB-backed pieces of the assistant pipeline. The Worker forwards the
+// user's Firebase Authorization header to authenticate here.
+
+// Given the Pinecone-matched opportunity ids, return the same serialized RAG
+// context block the in-server chat pipeline builds. Public data only.
+export const getRetrievedOpportunityContext = async (req: Request, res: Response) => {
+  try {
+    const rawIds: unknown = req.body?.ids;
+    const ids = Array.isArray(rawIds)
+      ? rawIds.filter((id): id is string => typeof id === 'string' && isValidObjectId(id)).slice(0, 8)
+      : [];
+
+    if (ids.length === 0) {
+      return res.json({ success: true, context: null });
+    }
+
+    const docs = await Opportunity.find({ _id: { $in: ids } }).lean();
+    const sorted = ids
+      .map(id => docs.find(d => d._id.toString() === id))
+      .filter((d): d is typeof d & object => !!d);
+
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.json({
+      success: true,
+      context: sorted.length > 0 ? serializeOpportunities(sorted) : null,
+    });
+  } catch (error: any) {
+    console.error('Failed to build opportunity context:', error);
+    res.status(500).json({ success: false, error: 'Failed to build opportunity context.' });
+  }
+};
+
+// Detect persisted paid records + write the MentorshipComplaint ticket, then
+// hand back the exact reply string the assistant should stream.
+export const recordMentorshipComplaint = async (req: Request, res: Response) => {
+  try {
+    const message = ((req.body?.message as string) || '').trim().slice(0, 2000);
+    if (!message) {
+      return res.status(400).json({ success: false, error: 'Message is required.' });
+    }
+    const reply = await handleMentorshipComplaint(
+      message,
+      req.authUser!.uid,
+      req.authUser!.email || '',
+      (req.body?.userName as string) || ''
+    );
+    res.json({ success: true, reply });
+  } catch (error: any) {
+    console.error('Failed to record mentorship complaint:', error);
+    res.status(500).json({ success: false, error: 'Failed to record mentorship complaint.' });
   }
 };
 

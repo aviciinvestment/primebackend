@@ -1,12 +1,12 @@
 import express from 'express';
 import { runOpportunitySync } from '../services/syncOpportunities';
+import { requireAdmin } from '../middleware/auth';
 
 const router = express.Router();
 
 // POST /api/sync/run — manually trigger a full opportunity sync.
-// Useful for testing and for external schedulers (cron/CI) if desired.
-// The built-in scheduler in index.ts runs this automatically on boot + daily.
-router.post('/run', async (_req, res) => {
+// Admin only (verified Firebase token, not the old spoofable header).
+router.post('/run', requireAdmin, async (_req, res) => {
   try {
     const result = await runOpportunitySync();
     res.json({ success: true, result });

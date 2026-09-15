@@ -19,7 +19,6 @@ export const getMentorshipConfig = (_req: Request, res: Response) => {
 export const createMentorshipRequest = async (req: Request, res: Response) => {
   try {
     const {
-      userId,
       userEmail,
       userName,
       opportunityId,
@@ -32,15 +31,43 @@ export const createMentorshipRequest = async (req: Request, res: Response) => {
       currency,
       provider,
       reference,
-      status,
       note,
     } = req.body || {};
 
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'userId is required.' });
-    }
+    const userId = req.authUser!.uid;
     if (!reference) {
       return res.status(400).json({ success: false, error: 'Payment reference is required.' });
+    }
+    if (provider !== 'paystack' && provider !== 'demo') {
+      return res.status(400).json({ success: false, error: 'Unknown payment provider.' });
+    }
+
+    // The server (never the client) decides whether a request counts as paid.
+    let status: 'paid' | 'pending' | 'failed';
+    if (provider === 'demo') {
+      // Demo automatically "pays" so the flow can be exercised end-to-end.
+      status = 'paid';
+    } else {
+      // Real Paystack: only accept once the secret key is configured, and leave
+      // payment confirmation to server-side verification / webhook.
+      if (!process.env.PAYSTACK_SECRET_KEY) {
+        return res.status(400).json({
+          success: false,
+          error: 'Card payments are not enabled yet. Please try again later.',
+        });
+      }
+      status = 'pending';
+    }
+
+    // Guard against forged amounts: a mentorship request must match the
+    // configured package price (or be recorded as failed).
+    const expectedAmount = GUIDANCE_AMOUNT;
+    const finalAmount = Number(amount);
+    if (!Number.isFinite(finalAmount) || finalAmount < 0) {
+      return res.status(400).json({ success: false, error: 'Invalid amount.' });
+    }
+    if (finalAmount !== expectedAmount) {
+      status = 'failed';
     }
 
     const record = await Mentorship.create({
@@ -53,8 +80,8 @@ export const createMentorshipRequest = async (req: Request, res: Response) => {
       opportunityUrl,
       opportunityType,
       opportunityCategory,
-      amount,
-      currency,
+      amount: finalAmount,
+      currency: currency || GUIDANCE_CURRENCY,
       provider,
       reference,
       status,
@@ -83,10 +110,9 @@ export const createMentorshipRequest = async (req: Request, res: Response) => {
 
 export const getMentorships = async (req: Request, res: Response) => {
   try {
-    const { userId } = req.query;
-    if (!userId) return res.status(400).json({ success: false, error: 'userId is required.' });
+    const userId = req.authUser!.uid;
 
-    const records = await Mentorship.find({ userId: String(userId) }).sort({ createdAt: -1 });
+    const records = await Mentorship.find({ userId }).sort({ createdAt: -1 });
     res.json({ success: true, count: records.length, data: records });
   } catch (error: any) {
     console.error('Failed to list mentorship requests:', error);

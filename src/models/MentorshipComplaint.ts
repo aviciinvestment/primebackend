@@ -45,4 +45,7 @@ const MentorshipComplaintSchema: Schema = new Schema(
   { timestamps: true }
 );
 
+// Admin inbox lists by status, newest first.
+MentorshipComplaintSchema.index({ status: 1, createdAt: -1 });
+
 export default mongoose.model<IMentorshipComplaint>('MentorshipComplaint', MentorshipComplaintSchema);

@@ -1,6 +1,5 @@
 import express from 'express';
 import {
-  requireAdmin,
   getOverview,
   listUsers,
   listMentors,
@@ -10,6 +9,7 @@ import {
   listComplaints,
   resolveComplaint,
 } from '../controllers/adminController';
+import { requireAdmin } from '../middleware/auth';
 import {
   getAdminLaunch,
   setLaunchState,

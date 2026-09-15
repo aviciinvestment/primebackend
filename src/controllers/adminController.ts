@@ -1,4 +1,4 @@
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response } from 'express';
 import { isValidObjectId } from 'mongoose';
 import AppUser from '../models/AppUser';
 import Mentor from '../models/Mentor';
@@ -7,35 +7,22 @@ import MentorshipComplaint from '../models/MentorshipComplaint';
 
 const PLATFORM_CUT = 0.1; // platform keeps 10% of every mentee payment
 
-export const requireAdmin = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const uid = String(req.headers['x-user-uid'] || '');
-    if (!uid) {
-      return res.status(401).json({ success: false, error: 'Authentication required.' });
-    }
-    const user = await AppUser.findOne({ uid });
-    if (!user || user.role !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Admin access only.' });
-    }
-    return next();
-  } catch (error: any) {
-    console.error('requireAdmin error:', error);
-    return res.status(500).json({ success: false, error: 'Server error.' });
-  }
-};
-
 export const getOverview = async (_req: Request, res: Response) => {
   try {
-    const [totalUsers, totalMentors, pendingMentorApplications, totalMentees, paidRequests] =
+    const [totalUsers, totalMentors, pendingMentorApplications, totalMentees, revenueAgg] =
       await Promise.all([
         AppUser.countDocuments(),
         Mentor.countDocuments({ status: 'approved' }),
         Mentor.countDocuments({ status: 'pending' }),
         Mentorship.countDocuments({ status: 'paid', mentorId: { $ne: null } }),
-        Mentorship.find({ status: 'paid' }).lean(),
+        Mentorship.aggregate<{ gross: number; count: number }>([
+          { $match: { status: 'paid' } },
+          { $group: { _id: null, gross: { $sum: { $ifNull: ['$amount', 0] } }, count: { $sum: 1 } } },
+        ]),
       ]);
 
-    const grossRevenue = paidRequests.reduce((sum, m) => sum + (m.amount || 0), 0);
+    const grossRevenue = revenueAgg[0]?.gross ?? 0;
+    const paidMenteeCount = revenueAgg[0]?.count ?? 0;
 
     res.json({
       success: true,
@@ -79,27 +66,30 @@ export const listMentors = async (_req: Request, res: Response) => {
   try {
     const mentors = await Mentor.find().sort({ createdAt: -1 }).lean();
 
-    const results = await Promise.all(
-      mentors.map(async m => {
-        const [menteesCount, paid] = await Promise.all([
-          Mentorship.countDocuments({ mentorId: m.userId, status: 'paid' }),
-          Mentorship.find({ mentorId: m.userId, status: 'paid' }).lean(),
-        ]);
-        const gross = paid.reduce((sum, r) => sum + (r.amount || 0), 0);
-        return {
-          userId: m.userId,
-          name: m.name,
-          email: m.email,
-          company: m.company,
-          roleType: m.roleType,
-          careerStory: m.careerStory,
-          status: m.status,
-          menteesCount,
-          accountBalance: gross * (1 - PLATFORM_CUT),
-          createdAt: m.createdAt,
-        };
-      })
-    );
+    // One aggregation for every mentor's paid count + gross instead of N+1 queries.
+    const stats = await Mentorship.aggregate<{ mentorId: string; total: number; gross: number }>([
+      { $match: { status: 'paid', mentorId: { $ne: null } } },
+      { $group: { _id: '$mentorId', total: { $sum: 1 }, gross: { $sum: { $ifNull: ['$amount', 0] } } } },
+    ]);
+    const statsByMentor = new Map(stats.map(s => [s._id, s]));
+
+    const results = mentors.map(m => {
+      const stat = statsByMentor.get(m.userId);
+      const menteesCount = stat?.total ?? 0;
+      const gross = stat?.gross ?? 0;
+      return {
+        userId: m.userId,
+        name: m.name,
+        email: m.email,
+        company: m.company,
+        roleType: m.roleType,
+        careerStory: m.careerStory,
+        status: m.status,
+        menteesCount,
+        accountBalance: gross * (1 - PLATFORM_CUT),
+        createdAt: m.createdAt,
+      };
+    });
 
     res.json({ success: true, mentors: results });
   } catch (error: any) {

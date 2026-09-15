@@ -164,9 +164,14 @@ export const setLaunchTimer = async (req: Request, res: Response) => {
 };
 
 // Admin — where users get redirected after joining the waitlist (WhatsApp group).
+// Only https:// URLs are accepted so the stored link can never turn into a
+// javascript:/data: vector used by WaitlistSection's window.location redirect.
 export const setWhatsappGroup = async (req: Request, res: Response) => {
   try {
     const url = String(req.body?.url || '').trim();
+    if (url && !/^https:\/\//i.test(url)) {
+      return res.status(400).json({ success: false, error: 'Only https:// links are allowed.' });
+    }
     const config = await getConfig();
     config.whatsappGroupUrl = url;
     await config.save();

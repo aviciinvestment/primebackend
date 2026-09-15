@@ -15,10 +15,8 @@ const ADMIN_UIDS = new Set(
 // can approve mentors and manage the platform.
 export const syncUser = async (req: Request, res: Response) => {
   try {
-    const { uid, email, displayName, photoURL } = req.body || {};
-    if (!uid) {
-      return res.status(400).json({ success: false, error: 'uid is required.' });
-    }
+    const uid = req.authUser!.uid;
+    const { email, displayName, photoURL } = req.body || {};
 
     const isFirstUser = (await AppUser.countDocuments()) === 0;
     const role: 'user' | 'admin' =
@@ -70,10 +68,9 @@ export const syncUser = async (req: Request, res: Response) => {
 
 export const getUser = async (req: Request, res: Response) => {
   try {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ success: false, error: 'uid is required.' });
+    const uid = req.authUser!.uid;
 
-    const user = await AppUser.findOne({ uid: String(uid) }).lean();
+    const user = await AppUser.findOne({ uid }).lean();
     res.json({
       success: true,
       user: user
@@ -90,8 +87,8 @@ export const getUser = async (req: Request, res: Response) => {
 // page asks Yes/No). The answer surfaces on the admin user list.
 export const recordMentorshipInterest = async (req: Request, res: Response) => {
   try {
-    const { uid, choice, source, opportunityTitle, opportunityUrl } = req.body || {};
-    if (!uid) return res.status(400).json({ success: false, error: 'uid is required.' });
+    const uid = req.authUser!.uid;
+    const { choice, source, opportunityTitle, opportunityUrl } = req.body || {};
     if (choice !== 'yes' && choice !== 'no') {
       return res.status(400).json({ success: false, error: 'choice must be "yes" or "no".' });
     }

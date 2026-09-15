@@ -6,12 +6,9 @@ const MENTOR_CUT = 0.9; // mentors keep 90%, platform keeps 10%
 
 export const registerMentor = async (req: Request, res: Response) => {
   try {
-    const { userId, name, email, company, roleType, careerStory } = req.body;
+    const userId = req.authUser!.uid;
+    const { name, email, company, roleType, careerStory } = req.body;
 
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required.' });
-      return;
-    }
     if (!company?.trim() || !roleType?.trim() || !careerStory?.trim()) {
       res.status(400).json({ success: false, message: 'Company, role type, and career story are all required.' });
       return;
@@ -52,11 +49,7 @@ export const registerMentor = async (req: Request, res: Response) => {
 
 export const getMentorProfile = async (req: Request, res: Response) => {
   try {
-    const userId = (req.query.userId as string) || '';
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required.' });
-      return;
-    }
+    const userId = req.authUser!.uid;
 
     const mentor = await Mentor.findOne({ userId }).lean();
     res.json({
@@ -121,11 +114,7 @@ export const assignMentorToMentee = async (mentorship: any) => {
 
 export const getMentorDashboard = async (req: Request, res: Response) => {
   try {
-    const userId = (req.query.userId as string) || '';
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required.' });
-      return;
-    }
+    const userId = req.authUser!.uid;
 
     const mentor = await Mentor.findOne({ userId }).lean();
     if (!mentor || mentor.status !== 'approved') {

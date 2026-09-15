@@ -17,16 +17,12 @@ const populateApplication = (app: any) => {
   };
 };
 
-// @desc    Get a user's applications (with populated opportunities)
-// @route   GET /api/applications?userId=...
-// @access  Public (scoped by userId param; matches existing CV convention)
+// @desc    Get the authenticated user's applications (with populated opportunities)
+// @route   GET /api/applications
+// @access  Protected (scoped to the verified Firebase identity)
 export const getApplications = async (req: Request, res: Response) => {
   try {
-    const userId = (req.query.userId as string) || '';
-    if (!userId) {
-      res.status(400).json({ success: false, message: 'userId is required' });
-      return;
-    }
+    const userId = req.authUser!.uid;
 
     const apps = await Application.find({ userId }).populate('opportunityId').sort({ updatedAt: -1 });
 
@@ -37,22 +33,22 @@ export const getApplications = async (req: Request, res: Response) => {
   }
 };
 
-// @desc    Create/update a user's application record for one opportunity
+// @desc    Create/update the authenticated user's application record for one opportunity
 // @route   POST /api/applications
-// @access  Public (scoped by userId in body)
+// @access  Protected (uid comes from the verified token)
 //
-// Body: { userId, opportunityId, status?, clicked? }
+// Body: { opportunityId, status?, clicked? }
 //  - status: 'saved' | 'applied' | 'interview' | 'accepted' | 'rejected'
 //  - clicked: true when the user opened the opportunity link (visited marker)
 export const upsertApplication = async (req: Request, res: Response) => {
   try {
-    const userId = (req.body?.userId as string) || '';
+    const userId = req.authUser!.uid;
     const opportunityId = (req.body?.opportunityId as string) || '';
     const status = req.body?.status as ApplicationStatus | undefined;
     const clicked = req.body?.clicked === true;
 
-    if (!userId || !opportunityId) {
-      res.status(400).json({ success: false, message: 'userId and opportunityId are required' });
+    if (!opportunityId) {
+      res.status(400).json({ success: false, message: 'opportunityId is required' });
       return;
     }
     if (status && !VALID_STATUSES.includes(status)) {

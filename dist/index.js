@@ -24,10 +24,12 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 
 // src/index.ts
 var import_config = require("dotenv/config");
-var import_express20 = __toESM(require("express"));
+var import_express18 = __toESM(require("express"));
 var import_cors = __toESM(require("cors"));
 var import_mongoose13 = __toESM(require("mongoose"));
 var import_node_cron = __toESM(require("node-cron"));
+var import_helmet = __toESM(require("helmet"));
+var import_multer2 = __toESM(require("multer"));
 
 // src/models/Opportunity.ts
 var import_mongoose = __toESM(require("mongoose"));
@@ -98,6 +100,8 @@ OpportunitySchema.index({ deadline: 1 });
 OpportunitySchema.index({ eligibleEducationLevels: 1 });
 OpportunitySchema.index({ eligibleFields: 1 });
 OpportunitySchema.index({ eligibleCountries: 1 });
+OpportunitySchema.index({ officialUrl: 1 });
+OpportunitySchema.index({ status: 1, priorityScore: -1, dateDiscovered: -1 });
 OpportunitySchema.index({
   title: "text",
   organization: "text",
@@ -1009,6 +1013,9 @@ var setLaunchTimer = async (req, res) => {
 var setWhatsappGroup = async (req, res) => {
   try {
     const url = String(req.body?.url || "").trim();
+    if (url && !/^https:\/\//i.test(url)) {
+      return res.status(400).json({ success: false, error: "Only https:// links are allowed." });
+    }
     const config = await getConfig();
     config.whatsappGroupUrl = url;
     await config.save();
@@ -1016,6 +1023,73 @@ var setWhatsappGroup = async (req, res) => {
   } catch (error) {
     console.error("Failed to set WhatsApp group:", error);
     res.status(500).json({ success: false, error: "Failed to save the WhatsApp group link." });
+  }
+};
+
+// src/middleware/rateLimit.ts
+var import_express_rate_limit = __toESM(require("express-rate-limit"));
+var errorJson = (req, res) => {
+  res.status(429).json({ success: false, error: "Too many requests. Please try again shortly." });
+};
+var apiLimiter = (0, import_express_rate_limit.default)({
+  windowMs: 60 * 1e3,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: errorJson
+});
+var strictLimiter = (0, import_express_rate_limit.default)({
+  windowMs: 60 * 1e3,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: errorJson
+});
+var sensitiveLimiter = (0, import_express_rate_limit.default)({
+  windowMs: 60 * 1e3,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: errorJson
+});
+
+// src/lib/withLock.ts
+var import_mongoose4 = __toESM(require("mongoose"));
+var SyncLockSchema = new import_mongoose4.Schema(
+  {
+    _id: { type: String, required: true },
+    // lock name
+    acquiredAt: { type: Date, required: true },
+    expiresAt: { type: Date, required: true },
+    owner: { type: String, required: true }
+  },
+  { versionKey: false }
+);
+var SyncLock = import_mongoose4.default.models.SyncLock || import_mongoose4.default.model("SyncLock", SyncLockSchema);
+var acquire = async (name, ttlMs, owner) => {
+  const now = /* @__PURE__ */ new Date();
+  const result = await SyncLock.findOneAndUpdate(
+    {
+      _id: name,
+      $or: [{ expiresAt: { $lt: now } }, { expiresAt: { $exists: false } }]
+    },
+    { _id: name, acquiredAt: now, expiresAt: new Date(now.getTime() + ttlMs), owner },
+    { upsert: true, new: true }
+  );
+  return result?.owner === owner;
+};
+var withLock = async (name, ttlMs, fn) => {
+  const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const held = await acquire(name, ttlMs, owner);
+  if (!held) {
+    console.log(`[lock] "${name}" is held by another run \u2014 skipping.`);
+    return null;
+  }
+  try {
+    return await fn();
+  } finally {
+    await SyncLock.deleteOne({ _id: name, owner }).catch(() => {
+    });
   }
 };
 
@@ -1139,104 +1213,12 @@ router.get("/", getOpportunities);
 router.get("/:id", getOpportunity);
 var opportunityRoutes_default = router;
 
-// src/routes/authRoutes.ts
-var import_express5 = __toESM(require("express"));
-
-// src/controllers/authController.ts
-var import_express4 = require("express");
-var import_bcrypt = __toESM(require("bcrypt"));
-var import_jsonwebtoken = __toESM(require("jsonwebtoken"));
-
-// src/models/User.ts
-var import_mongoose4 = __toESM(require("mongoose"));
-var UserSchema = new import_mongoose4.Schema(
-  {
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true },
-    role: { type: String, enum: ["user", "admin"], default: "user" },
-    firstName: { type: String, required: true },
-    lastName: { type: String, required: true }
-  },
-  { timestamps: true }
-);
-var User_default = import_mongoose4.default.model("User", UserSchema);
-
-// src/controllers/authController.ts
-var registerUser = async (req, res) => {
-  try {
-    const { email, password, firstName, lastName } = req.body;
-    const existingUser = await User_default.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ success: false, error: "Email already exists" });
-    }
-    const salt = await import_bcrypt.default.genSalt(10);
-    const passwordHash = await import_bcrypt.default.hash(password, salt);
-    const user = await User_default.create({
-      email,
-      passwordHash,
-      firstName,
-      lastName
-    });
-    const token = import_jsonwebtoken.default.sign({ id: user._id }, process.env.JWT_SECRET || "secret", {
-      expiresIn: "30d"
-    });
-    res.status(201).json({
-      success: true,
-      token,
-      user: {
-        id: user._id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Server error" });
-  }
-};
-var loginUser = async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await User_default.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ success: false, error: "Invalid credentials" });
-    }
-    const isMatch = await import_bcrypt.default.compare(password, user.passwordHash);
-    if (!isMatch) {
-      return res.status(400).json({ success: false, error: "Invalid credentials" });
-    }
-    const token = import_jsonwebtoken.default.sign({ id: user._id }, process.env.JWT_SECRET || "secret", {
-      expiresIn: "30d"
-    });
-    res.status(200).json({
-      success: true,
-      token,
-      user: {
-        id: user._id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Server error" });
-  }
-};
-
-// src/routes/authRoutes.ts
-var router2 = import_express5.default.Router();
-router2.post("/register", registerUser);
-router2.post("/login", loginUser);
-var authRoutes_default = router2;
-
 // src/routes/aiRoutes.ts
-var import_express7 = __toESM(require("express"));
+var import_express5 = __toESM(require("express"));
 var import_multer = __toESM(require("multer"));
 
 // src/controllers/aiController.ts
-var import_express6 = require("express");
+var import_express4 = require("express");
 var import_mongoose8 = require("mongoose");
 var import_pdf_parse = require("pdf-parse");
 var import_pinecone2 = require("@pinecone-database/pinecone");
@@ -1285,6 +1267,9 @@ var MentorshipSchema = new import_mongoose6.Schema(
   },
   { timestamps: true }
 );
+MentorshipSchema.index({ status: 1 });
+MentorshipSchema.index({ status: 1, mentorId: 1 });
+MentorshipSchema.index({ mentorId: 1, status: 1 });
 var Mentorship_default = import_mongoose6.default.model("Mentorship", MentorshipSchema);
 
 // src/models/MentorshipComplaint.ts
@@ -1312,22 +1297,43 @@ var MentorshipComplaintSchema = new import_mongoose7.Schema(
   },
   { timestamps: true }
 );
+MentorshipComplaintSchema.index({ status: 1, createdAt: -1 });
 var MentorshipComplaint_default = import_mongoose7.default.model("MentorshipComplaint", MentorshipComplaintSchema);
 
-// src/controllers/aiController.ts
-var pinecone2 = new import_pinecone2.Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-var INDEX_NAME2 = "prime-opportunity-index";
-var nvidiaEmbedClient = new import_openai2.default({
-  apiKey: process.env.NVIDIA_EMBED_API_KEY,
-  baseURL: "https://integrate.api.nvidia.com/v1"
-});
-var nvidiaChatClient = new import_openai2.default({
-  apiKey: process.env.NVIDIA_API_KEY,
-  baseURL: "https://integrate.api.nvidia.com/v1",
-  timeout: 9e4,
-  maxRetries: 1
-});
-var CV_NAMESPACE_PREFIX = "cvs-";
+// src/lib/cache.ts
+var LRUCache = class {
+  constructor(max = 500, ttlMs = 6e4) {
+    this.ttlMs = ttlMs;
+    this.max = max;
+  }
+  ttlMs;
+  max;
+  map = /* @__PURE__ */ new Map();
+  get(key) {
+    const entry = this.map.get(key);
+    if (!entry) return void 0;
+    if (entry.created + this.ttlMs < Date.now()) {
+      this.map.delete(key);
+      return void 0;
+    }
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return entry.value;
+  }
+  set(key, value) {
+    if (this.get(key) !== void 0) return;
+    this.map.set(key, { value, created: Date.now() });
+    if (this.map.size > this.max) {
+      this.map.delete(this.map.keys().next().value);
+    }
+  }
+  get size() {
+    return this.map.size;
+  }
+};
+var aiReplyCache = new LRUCache(300, 30 * 60 * 1e3);
+
+// ../shared/chatPolicies.ts
 var OFF_TOPIC_REFUSAL = "I don't have information on that in this jurisdiction. I can only help you with scholarships, internships, graduate trainee programmes, and fellowships on PrimeOpportunity.";
 var OFF_TOPIC_PATTERNS = [
   /hack (into|his|her|their|my)|crack (a )?password|break into (an?|the|my|someone'?s) (account|phone|computer|pc|system)|create (a )?virus|malware|phishing/i,
@@ -1373,6 +1379,81 @@ var makeTicket = () => {
   const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
   return `TKT-${Date.now().toString(36).toUpperCase()}-${suffix}`;
 };
+var buildMentorshipReply = (fee, currency) => `Great choice! Our **mentorship guidance** pairs you with an industry mentor who reviews your applications, coaches you, and boosts your chances of getting in.
+
+It costs **${currency} ${Number(fee).toLocaleString()}** per opportunity and you can pay securely right from the page.
+
+Click the button below to get started.`;
+var buildComplaintReply = (userEmail, ticket) => `I'm sorry to hear that \u2014 you should already have a mentor after paying.
+
+I've sent your message straight to our admin team along with your account details (email: ${userEmail || "not provided"}). You don't need to do anything else; someone will follow up on your payment and assign a mentor as soon as possible.
+
+Your ticket number is **${ticket}** \u2014 you can reference it if you reach out again.`;
+var serializeOpportunities = (opps) => opps.map(
+  (opp, idx) => `[${idx + 1}] ${opp.title || ""} at ${opp.organization || ""}
+Type: ${opp.opportunityType || "Unknown"}
+Category: ${opp.category || "N/A"}
+Location: ${opp.location || "N/A"}
+Field(s): ${opp.eligibleFields && opp.eligibleFields.length > 0 ? opp.eligibleFields.join(", ") : "N/A"}
+Eligibility: ${opp.eligibleEducationLevels && opp.eligibleEducationLevels.length > 0 ? opp.eligibleEducationLevels.join(", ") : opp.targetAudience && opp.targetAudience.length > 0 ? opp.targetAudience.join(", ") : "N/A"}
+Deadline: ${opp.deadline ? String(opp.deadline) : "Not specified"}
+Status: ${opp.status || "Unknown"}
+Tags: ${opp.tags && opp.tags.length > 0 ? opp.tags.join(", ") : "None"}
+Description: ${opp.description || "N/A"}
+More info: ${opp.officialUrl || "N/A"}`
+).join("\n\n");
+var buildSystemPrompt = (opts) => {
+  const { userCvContext, retrievedContext } = opts;
+  return `You are PrimeOpportunity AI, a friendly and knowledgeable assistant for PrimeOpportunity \u2014 a platform that helps Nigerian students and early-career professionals discover tailored scholarships, internships, graduate trainee programmes, and fellowships.
+
+ABOUT THE PLATFORM:
+- The site offers a searchable, filterable feed of opportunities (Scholarship, Internship, Graduate Trainee, Fellowship).
+- Users can filter by Opportunity Type and Education Level (Undergraduate, Final-Year, Recent Graduate, Postgraduate).
+- Logged-in users can upload their CV (PDF) and the AI analyzes their profile to find perfect matches, then filter the feed by "CV Match".
+- Opportunities include details like organization, category, location, deadline, eligibility, funding, and official application links.
+
+YOUR JOB:
+Using the RETRIEVED OPPORTUNITIES and the USER'S OWN CV PROFILE sections below when relevant, answer the user's question accurately and helpfully. Follow these rules:
+1. When the user asks about specific opportunities (e.g. "internships in Lagos", "scholarships for engineering"), prioritize the retrieved opportunities and clearly list the most relevant ones with their organization, deadline, and a link to apply.
+2. When the user asks personalized questions ("what internships fit my CV?", "summarize my CV", "what are my strengths?"), use the USER'S OWN CV PROFILE to give tailored advice.
+3. When answering, cite the opportunity title and organization so the user can verify.
+4. Use a hyperlink markdown format for official links, e.g. [Apply here](https://example.com).
+5. Do NOT invent or hallucinate opportunities that are not in the retrieved list. If nothing relevant was retrieved, say so and give general advice instead.
+6. Keep answers concise (under ~250 words), well-structured with bullet points where helpful. Respond in plain markdown.
+7. If the user asks about logging in, uploading a CV, filters, or how the site works, explain those features.
+
+PRIVACY RULES (STRICT):
+- The USER'S OWN CV PROFILE belongs solely to the current user. You must NEVER claim to know the details, CV, or personal information of any other user.
+- Never reveal, repeat, or export raw CV information in a way that could be shared with others; summarize it only for the user who owns it.
+- If asked about another person's CV or data, politely decline.
+
+SCOPE GUARDRAIL (STRICT \u2014 NEVER BREAK):
+- You may ONLY answer questions related to PrimeOpportunity and its content: discovering and applying for scholarships, internships, graduate trainee programmes, and fellowships for Nigerian students and early-career professionals; platform features (search, filters, sort, CV upload, CV Match, login, account); and personalized advice based on the user's OWN CV so long as it stays relevant to those opportunities.
+- If the user asks about anything outside that scope \u2014 general knowledge, schoolwork, medical, legal, financial/investment, political, religious, relationship, entertainment, recipes, sports, tech/coding, current events, or ANY topic unrelated to the platform \u2014 you MUST NOT answer it or add any extra detail.
+- In that case, reply with EXACTLY this message and nothing else: "${OFF_TOPIC_REFUSAL}"
+- When in doubt, refuse with that exact message. Never improvise an answer outside the platform's scope.
+
+USER'S OWN CV PROFILE:
+${userCvContext || "The current user has not uploaded a CV yet (or none is vectorized). Do not claim you can see their CV."}
+
+RETRIEVED OPPORTUNITIES:
+${retrievedContext}`;
+};
+
+// src/controllers/aiController.ts
+var pinecone2 = new import_pinecone2.Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+var INDEX_NAME2 = "prime-opportunity-index";
+var nvidiaEmbedClient = new import_openai2.default({
+  apiKey: process.env.NVIDIA_EMBED_API_KEY,
+  baseURL: "https://integrate.api.nvidia.com/v1"
+});
+var nvidiaChatClient = new import_openai2.default({
+  apiKey: process.env.NVIDIA_API_KEY,
+  baseURL: "https://integrate.api.nvidia.com/v1",
+  timeout: 9e4,
+  maxRetries: 1
+});
+var CV_NAMESPACE_PREFIX = "cvs-";
 var handleMentorshipComplaint = async (message, userId, userEmail, userName) => {
   const ticket = makeTicket();
   try {
@@ -1399,11 +1480,7 @@ var handleMentorshipComplaint = async (message, userId, userEmail, userName) => 
   } catch (err) {
     console.error("Failed to persist mentorship complaint:", err);
   }
-  return `I'm sorry to hear that \u2014 you should already have a mentor after paying.
-
-I've sent your message straight to our admin team along with your account details (email: ${userEmail || "not provided"}). You don't need to do anything else; someone will follow up on your payment and assign a mentor as soon as possible.
-
-Your ticket number is **${ticket}** \u2014 you can reference it if you reach out again.`;
+  return buildComplaintReply(userEmail, ticket);
 };
 var chunkText = (text, chunkSize = 1e3, overlap = 150) => {
   const clean = text.trim();
@@ -1503,7 +1580,7 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       stream: false
     });
     const analysis = completion.choices[0].message.content;
-    const userId = req.body.userId || "";
+    const userId = req.authUser.uid;
     let savedCv = null;
     if (userId) {
       const cv = new Cv_default({
@@ -1542,41 +1619,59 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
 };
 var chatWithAI = async (req, res) => {
   try {
-    const message = (req.body.message || "").trim();
+    const message = (req.body?.message || "").trim();
     if (!message) {
       res.status(400).json({ success: false, message: "Message is required." });
       return;
     }
     const rawHistory = Array.isArray(req.body.history) ? req.body.history : [];
     const history = rawHistory.filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-10);
-    const userId = (req.body.userId || "").trim();
+    const userId = req.authUser.uid;
+    const userEmail = (req.body?.userEmail || req.authUser.email || "").trim();
+    const userName = (req.body?.userName || "").trim();
+    const stream = req.body?.stream === true;
+    const startSse = () => {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders?.();
+    };
+    const writeSse = (frame) => {
+      if (stream && !res.writableEnded) res.write(`data: ${JSON.stringify(frame)}
+
+`);
+    };
+    const respondDone = (reply2, action) => {
+      if (stream) {
+        writeSse({ type: "done", reply: reply2, action: action || null });
+        res.end();
+      } else {
+        res.json({ success: true, reply: reply2, action: action || void 0 });
+      }
+    };
+    if (stream) {
+      startSse();
+    }
+    const cacheKey = `${userId}|${message}`;
+    const cached = aiReplyCache.get(cacheKey);
+    if (cached) {
+      return respondDone(cached.reply);
+    }
     if (isOffTopic(message)) {
-      res.json({ success: true, reply: OFF_TOPIC_REFUSAL });
-      return;
+      return respondDone(OFF_TOPIC_REFUSAL);
     }
     if (hasMentorshipComplaint(message)) {
-      const reply2 = await handleMentorshipComplaint(
-        message,
-        userId,
-        (req.body.userEmail || "").trim(),
-        (req.body.userName || "").trim()
-      );
-      res.json({ success: true, reply: reply2 });
-      return;
+      const reply2 = await handleMentorshipComplaint(message, userId, userEmail, userName);
+      return respondDone(reply2);
     }
     if (hasMentorshipIntent(message)) {
       const fee = parseInt(process.env.MENTORSHIP_FEE || "20000", 10) || 2e4;
       const currency = process.env.MENTORSHIP_CURRENCY || "NGN";
-      res.json({
-        success: true,
-        action: { type: "mentorship" },
-        reply: `Great choice! Our **mentorship guidance** pairs you with an industry mentor who reviews your applications, coaches you, and boosts your chances of getting in.
-
-It costs **${currency} ${fee.toLocaleString()}** per opportunity and you can pay securely right from the page.
-
-Click the button below to get started.`
-      });
-      return;
+      return respondDone(
+        buildMentorshipReply(String(fee), currency),
+        { type: "mentorship" }
+      );
     }
     const embedResponse = await nvidiaEmbedClient.embeddings.create({
       model: "nvidia/nemotron-3-embed-1b",
@@ -1595,20 +1690,7 @@ Click the button below to get started.`
       const matchedOpportunities = await Opportunity_default.find({ _id: { $in: matchIds } });
       const sortedOpportunities = matchIds.map((id) => matchedOpportunities.find((o) => o._id.toString() === id)).filter(Boolean);
       if (sortedOpportunities.length > 0) {
-        retrievedContext = sortedOpportunities.map((opp, idx) => {
-          const tags = opp.tags && opp.tags.length > 0 ? opp.tags.join(", ") : "None";
-          return `[${idx + 1}] ${opp.title} at ${opp.organization}
-  Type: ${opp.opportunityType || "Unknown"}
-  Category: ${opp.category || "N/A"}
-  Location: ${opp.location || "N/A"}
-  Field(s): ${opp.eligibleFields ? opp.eligibleFields.join(", ") : "N/A"}
-  Eligibility: ${opp.eligibleEducationLevels ? opp.eligibleEducationLevels.join(", ") : opp.targetAudience ? opp.targetAudience.join(", ") : "N/A"}
-  Deadline: ${opp.deadline || "Not specified"}
-  Status: ${opp.status || "Unknown"}
-  Tags: ${tags}
-  Description: ${opp.description || "N/A"}
-  More info: ${opp.officialUrl || "N/A"}`;
-        }).join("\n\n");
+        retrievedContext = serializeOpportunities(sortedOpportunities);
       }
     }
     let userCvContext = "";
@@ -1646,56 +1728,59 @@ Click the button below to get started.`
         console.error("Could not retrieve user CV context:", cvErr);
       }
     }
-    const systemPrompt = `You are PrimeOpportunity AI, a friendly and knowledgeable assistant for PrimeOpportunity \u2014 a platform that helps Nigerian students and early-career professionals discover tailored scholarships, internships, graduate trainee programmes, and fellowships.
-
-ABOUT THE PLATFORM:
-- The site offers a searchable, filterable feed of opportunities (Scholarship, Internship, Graduate Trainee, Fellowship).
-- Users can filter by Opportunity Type and Education Level (Undergraduate, Final-Year, Recent Graduate, Postgraduate).
-- Logged-in users can upload their CV (PDF) and the AI analyzes their profile to find perfect matches, then filter the feed by "CV Match".
-- Opportunities include details like organization, category, location, deadline, eligibility, funding, and official application links.
-
-YOUR JOB:
-Using the RETRIEVED OPPORTUNITIES and the USER'S OWN CV PROFILE sections below when relevant, answer the user's question accurately and helpfully. Follow these rules:
-1. When the user asks about specific opportunities (e.g. "internships in Lagos", "scholarships for engineering"), prioritize the retrieved opportunities and clearly list the most relevant ones with their organization, deadline, and a link to apply.
-2. When the user asks personalized questions ("what internships fit my CV?", "summarize my CV", "what are my strengths?"), use the USER'S OWN CV PROFILE to give tailored advice.
-3. When answering, cite the opportunity title and organization so the user can verify.
-4. Use a hyperlink markdown format for official links, e.g. [Apply here](https://example.com).
-5. Do NOT invent or hallucinate opportunities that are not in the retrieved list. If nothing relevant was retrieved, say so and give general advice instead.
-6. Keep answers concise (under ~250 words), well-structured with bullet points where helpful. Respond in plain markdown.
-7. If the user asks about logging in, uploading a CV, filters, or how the site works, explain those features.
-
-PRIVACY RULES (STRICT):
-- The USER'S OWN CV PROFILE belongs solely to the current user. You must NEVER claim to know the details, CV, or personal information of any other user.
-- Never reveal, repeat, or export raw CV information in a way that could be shared with others; summarize it only for the user who owns it.
-- If asked about another person's CV or data, politely decline.
-
-SCOPE GUARDRAIL (STRICT \u2014 NEVER BREAK):
-- You may ONLY answer questions related to PrimeOpportunity and its content: discovering and applying for scholarships, internships, graduate trainee programmes, and fellowships for Nigerian students and early-career professionals; platform features (search, filters, sort, CV upload, CV Match, login, account); and personalized advice based on the user's OWN CV so long as it stays relevant to those opportunities.
-- If the user asks about anything outside that scope \u2014 general knowledge, schoolwork, medical, legal, financial/investment, political, religious, relationship, entertainment, recipes, sports, tech/coding, current events, or ANY topic unrelated to the platform \u2014 you MUST NOT answer it or add any extra detail.
-- In that case, reply with EXACTLY this message and nothing else: "${OFF_TOPIC_REFUSAL}"
-- When in doubt, refuse with that exact message. Never improvise an answer outside the platform's scope.
-
-USER'S OWN CV PROFILE:
-${userCvContext || "The current user has not uploaded a CV yet (or none is vectorized). Do not claim you can see their CV."}
-
-RETRIEVED OPPORTUNITIES:
-${retrievedContext}`;
+    const systemPrompt = buildSystemPrompt({ userCvContext, retrievedContext });
+    const messages = [
+      { role: "system", content: systemPrompt },
+      ...history,
+      { role: "user", content: message }
+    ];
+    const abort = new AbortController();
+    req.on("close", () => abort.abort());
+    if (stream) {
+      const completion2 = await nvidiaChatClient.chat.completions.create({
+        model: "openai/gpt-oss-20b",
+        messages,
+        temperature: 0.6,
+        top_p: 0.95,
+        max_tokens: 700,
+        stream: true,
+        signal: abort.signal
+      });
+      let reply2 = "";
+      for await (const chunk of completion2) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          reply2 += delta;
+          writeSse({ type: "delta", text: delta });
+        }
+      }
+      if (!reply2.trim()) {
+        reply2 = "Sorry, I could not generate a response. Please try again.";
+      }
+      aiReplyCache.set(cacheKey, { reply: reply2 });
+      writeSse({ type: "done", reply: reply2 });
+      res.end();
+      return;
+    }
     const completion = await nvidiaChatClient.chat.completions.create({
       model: "openai/gpt-oss-20b",
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...history,
-        { role: "user", content: message }
-      ],
+      messages,
       temperature: 0.6,
       top_p: 0.95,
       max_tokens: 700,
       stream: false
     });
     const reply = completion.choices[0].message.content?.trim() || "Sorry, I could not generate a response. Please try again.";
+    aiReplyCache.set(cacheKey, { reply });
     res.json({ success: true, reply });
   } catch (error) {
     console.error("Error in AI chat:", error);
+    if (res.headersSent && !res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ type: "error", message: "Failed to process chat message." })}
+
+`);
+      return res.end();
+    }
     res.status(500).json({
       success: false,
       message: "Failed to process chat message.",
@@ -1821,11 +1906,7 @@ ${analysis}`.toLowerCase();
 };
 var getMyCVs = async (req, res) => {
   try {
-    const userId = req.query.userId || "";
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required." });
-      return;
-    }
+    const userId = req.authUser.uid;
     const cvs = await Cv_default.find({ userId }).sort({ createdAt: -1 }).limit(10).populate("matchIds");
     res.json({
       success: true,
@@ -1850,11 +1931,7 @@ var getMyCVs = async (req, res) => {
 var downloadCV = async (req, res) => {
   try {
     const { cvId } = req.params;
-    const userId = req.query.userId || "";
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required." });
-      return;
-    }
+    const userId = req.authUser.uid;
     if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
@@ -1876,11 +1953,7 @@ var downloadCV = async (req, res) => {
 var deleteCV = async (req, res) => {
   try {
     const { cvId } = req.params;
-    const userId = req.body.userId || "";
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required." });
-      return;
-    }
+    const userId = req.authUser.uid;
     if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
@@ -1902,9 +1975,121 @@ var deleteCV = async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to delete CV." });
   }
 };
+var getRetrievedOpportunityContext = async (req, res) => {
+  try {
+    const rawIds = req.body?.ids;
+    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose8.isValidObjectId)(id)).slice(0, 8) : [];
+    if (ids.length === 0) {
+      return res.json({ success: true, context: null });
+    }
+    const docs = await Opportunity_default.find({ _id: { $in: ids } }).lean();
+    const sorted = ids.map((id) => docs.find((d) => d._id.toString() === id)).filter((d) => !!d);
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.json({
+      success: true,
+      context: sorted.length > 0 ? serializeOpportunities(sorted) : null
+    });
+  } catch (error) {
+    console.error("Failed to build opportunity context:", error);
+    res.status(500).json({ success: false, error: "Failed to build opportunity context." });
+  }
+};
+var recordMentorshipComplaint = async (req, res) => {
+  try {
+    const message = (req.body?.message || "").trim().slice(0, 2e3);
+    if (!message) {
+      return res.status(400).json({ success: false, error: "Message is required." });
+    }
+    const reply = await handleMentorshipComplaint(
+      message,
+      req.authUser.uid,
+      req.authUser.email || "",
+      req.body?.userName || ""
+    );
+    res.json({ success: true, reply });
+  } catch (error) {
+    console.error("Failed to record mentorship complaint:", error);
+    res.status(500).json({ success: false, error: "Failed to record mentorship complaint." });
+  }
+};
+
+// src/lib/firebaseAdmin.ts
+var import_app = require("firebase-admin/app");
+var import_auth = require("firebase-admin/auth");
+var FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "primeopportunity-18381";
+var app = null;
+var initFirebaseAdmin = () => {
+  if (!app) {
+    app = (0, import_app.getApps)()[0] || (0, import_app.initializeApp)({ projectId: FIREBASE_PROJECT_ID });
+  }
+  return app;
+};
+var getAdminAuth = () => {
+  initFirebaseAdmin();
+  return (0, import_auth.getAuth)();
+};
+
+// src/models/AppUser.ts
+var import_mongoose9 = __toESM(require("mongoose"));
+var AppUserSchema = new import_mongoose9.Schema(
+  {
+    uid: { type: String, required: true, unique: true, index: true },
+    email: { type: String, trim: true, lowercase: true },
+    displayName: { type: String, trim: true },
+    photoURL: { type: String },
+    role: { type: String, enum: ["user", "admin"], default: "user" },
+    mentorshipInterest: {
+      choice: { type: String, enum: ["yes", "no", null], default: null },
+      source: { type: String, enum: ["opportunity", "general"], default: "general" },
+      opportunityTitle: { type: String, default: "" },
+      opportunityUrl: { type: String, default: "" },
+      answeredAt: { type: Date }
+    }
+  },
+  { timestamps: true }
+);
+var AppUser_default = import_mongoose9.default.model("AppUser", AppUserSchema);
+
+// src/middleware/auth.ts
+var BEARER_RE = /^Bearer\s+(.+)$/i;
+var verifyToken = async (req) => {
+  const header = req.headers.authorization || "";
+  const match = BEARER_RE.exec(header);
+  if (!match?.[1]) {
+    const err = new Error("Authentication required.");
+    err.status = 401;
+    throw err;
+  }
+  const decoded = await getAdminAuth().verifyIdToken(match[1].trim());
+  return {
+    uid: decoded.uid,
+    email: decoded.email || null,
+    emailVerified: !!decoded.email_verified
+  };
+};
+var requireAuth = async (req, res, next) => {
+  try {
+    req.authUser = await verifyToken(req);
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
+  }
+};
+var requireAdmin = async (req, res, next) => {
+  try {
+    req.authUser = await verifyToken(req);
+    const user = await AppUser_default.findOne({ uid: req.authUser.uid }).lean();
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, error: "Admin access only." });
+    }
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
+  }
+};
 
 // src/routes/aiRoutes.ts
-var router3 = import_express7.default.Router();
+var router2 = import_express5.default.Router();
 var storage = import_multer.default.memoryStorage();
 var upload = (0, import_multer.default)({
   storage,
@@ -1918,22 +2103,24 @@ var upload = (0, import_multer.default)({
     }
   }
 });
-router3.post("/analyze-cv", upload.single("cv"), analyzeCV);
-router3.get("/my-cvs", getMyCVs);
-router3.get("/cv/:cvId/download", downloadCV);
-router3.delete("/cv/:cvId", deleteCV);
-router3.post("/chat", chatWithAI);
-var aiRoutes_default = router3;
+router2.post("/analyze-cv", requireAuth, upload.single("cv"), analyzeCV);
+router2.get("/my-cvs", requireAuth, getMyCVs);
+router2.get("/cv/:cvId/download", requireAuth, downloadCV);
+router2.delete("/cv/:cvId", requireAuth, deleteCV);
+router2.post("/chat", requireAuth, chatWithAI);
+router2.post("/opportunity-context", requireAuth, getRetrievedOpportunityContext);
+router2.post("/mentorship-complaint", requireAuth, recordMentorshipComplaint);
+var aiRoutes_default = router2;
 
 // src/routes/mentorRoutes.ts
-var import_express9 = __toESM(require("express"));
+var import_express7 = __toESM(require("express"));
 
 // src/controllers/mentorController.ts
-var import_express8 = require("express");
+var import_express6 = require("express");
 
 // src/models/Mentor.ts
-var import_mongoose9 = __toESM(require("mongoose"));
-var MentorSchema = new import_mongoose9.Schema(
+var import_mongoose10 = __toESM(require("mongoose"));
+var MentorSchema = new import_mongoose10.Schema(
   {
     userId: { type: String, required: true, unique: true, index: true },
     name: { type: String },
@@ -1945,17 +2132,15 @@ var MentorSchema = new import_mongoose9.Schema(
   },
   { timestamps: true }
 );
-var Mentor_default = import_mongoose9.default.model("Mentor", MentorSchema);
+MentorSchema.index({ status: 1 });
+var Mentor_default = import_mongoose10.default.model("Mentor", MentorSchema);
 
 // src/controllers/mentorController.ts
 var MENTOR_CUT = 0.9;
 var registerMentor = async (req, res) => {
   try {
-    const { userId, name, email, company, roleType, careerStory } = req.body;
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required." });
-      return;
-    }
+    const userId = req.authUser.uid;
+    const { name, email, company, roleType, careerStory } = req.body;
     if (!company?.trim() || !roleType?.trim() || !careerStory?.trim()) {
       res.status(400).json({ success: false, message: "Company, role type, and career story are all required." });
       return;
@@ -1992,11 +2177,7 @@ var registerMentor = async (req, res) => {
 };
 var getMentorProfile = async (req, res) => {
   try {
-    const userId = req.query.userId || "";
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required." });
-      return;
-    }
+    const userId = req.authUser.uid;
     const mentor = await Mentor_default.findOne({ userId }).lean();
     res.json({
       success: true,
@@ -2041,11 +2222,7 @@ var assignMentorToMentee = async (mentorship) => {
 };
 var getMentorDashboard = async (req, res) => {
   try {
-    const userId = req.query.userId || "";
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required." });
-      return;
-    }
+    const userId = req.authUser.uid;
     const mentor = await Mentor_default.findOne({ userId }).lean();
     if (!mentor || mentor.status !== "approved") {
       res.status(403).json({
@@ -2072,16 +2249,16 @@ var getMentorDashboard = async (req, res) => {
 };
 
 // src/routes/mentorRoutes.ts
-var router4 = import_express9.default.Router();
-router4.post("/register", registerMentor);
-router4.get("/profile", getMentorProfile);
-router4.get("/dashboard", getMentorDashboard);
-var mentorRoutes_default = router4;
+var router3 = import_express7.default.Router();
+router3.post("/register", requireAuth, registerMentor);
+router3.get("/profile", requireAuth, getMentorProfile);
+router3.get("/dashboard", requireAuth, getMentorDashboard);
+var mentorRoutes_default = router3;
 
 // src/routes/syncRoutes.ts
-var import_express10 = __toESM(require("express"));
-var router5 = import_express10.default.Router();
-router5.post("/run", async (_req, res) => {
+var import_express8 = __toESM(require("express"));
+var router4 = import_express8.default.Router();
+router4.post("/run", requireAdmin, async (_req, res) => {
   try {
     const result = await runOpportunitySync();
     res.json({ success: true, result });
@@ -2090,20 +2267,20 @@ router5.post("/run", async (_req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-var syncRoutes_default = router5;
+var syncRoutes_default = router4;
 
 // src/routes/applicationRoutes.ts
-var import_express12 = __toESM(require("express"));
+var import_express10 = __toESM(require("express"));
 
 // src/controllers/applicationController.ts
-var import_express11 = require("express");
+var import_express9 = require("express");
 
 // src/models/Application.ts
-var import_mongoose10 = __toESM(require("mongoose"));
-var ApplicationSchema = new import_mongoose10.Schema(
+var import_mongoose11 = __toESM(require("mongoose"));
+var ApplicationSchema = new import_mongoose11.Schema(
   {
     userId: { type: String, required: true, index: true },
-    opportunityId: { type: import_mongoose10.Schema.Types.ObjectId, ref: "Opportunity", required: true },
+    opportunityId: { type: import_mongoose11.Schema.Types.ObjectId, ref: "Opportunity", required: true },
     status: {
       type: String,
       enum: ["saved", "applied", "interview", "accepted", "rejected"],
@@ -2116,30 +2293,26 @@ var ApplicationSchema = new import_mongoose10.Schema(
   { timestamps: true }
 );
 ApplicationSchema.index({ opportunityId: 1, userId: 1 }, { unique: true });
-var Application_default = import_mongoose10.default.model("Application", ApplicationSchema);
+var Application_default = import_mongoose11.default.model("Application", ApplicationSchema);
 
 // src/controllers/applicationController.ts
 var VALID_STATUSES = ["saved", "applied", "interview", "accepted", "rejected"];
-var populateApplication = (app2) => {
-  const opp = app2.opportunityId?._doc || app2.opportunityId;
+var populateApplication = (app3) => {
+  const opp = app3.opportunityId?._doc || app3.opportunityId;
   return {
-    _id: app2._id.toString(),
-    opportunityId: (app2.opportunityId?._id || app2.opportunityId)?.toString(),
-    status: app2.status,
-    clicked: app2.clicked,
-    clickedAt: app2.clickedAt || null,
-    dateApplied: app2.dateApplied || null,
-    updatedAt: app2.updatedAt || null,
+    _id: app3._id.toString(),
+    opportunityId: (app3.opportunityId?._id || app3.opportunityId)?.toString(),
+    status: app3.status,
+    clicked: app3.clicked,
+    clickedAt: app3.clickedAt || null,
+    dateApplied: app3.dateApplied || null,
+    updatedAt: app3.updatedAt || null,
     opportunity: opp ? { ...opp } : null
   };
 };
 var getApplications = async (req, res) => {
   try {
-    const userId = req.query.userId || "";
-    if (!userId) {
-      res.status(400).json({ success: false, message: "userId is required" });
-      return;
-    }
+    const userId = req.authUser.uid;
     const apps = await Application_default.find({ userId }).populate("opportunityId").sort({ updatedAt: -1 });
     res.json({ success: true, count: apps.length, data: apps.map(populateApplication) });
   } catch (error) {
@@ -2149,12 +2322,12 @@ var getApplications = async (req, res) => {
 };
 var upsertApplication = async (req, res) => {
   try {
-    const userId = req.body?.userId || "";
+    const userId = req.authUser.uid;
     const opportunityId = req.body?.opportunityId || "";
     const status = req.body?.status;
     const clicked = req.body?.clicked === true;
-    if (!userId || !opportunityId) {
-      res.status(400).json({ success: false, message: "userId and opportunityId are required" });
+    if (!opportunityId) {
+      res.status(400).json({ success: false, message: "opportunityId is required" });
       return;
     }
     if (status && !VALID_STATUSES.includes(status)) {
@@ -2199,16 +2372,16 @@ var upsertApplication = async (req, res) => {
 };
 
 // src/routes/applicationRoutes.ts
-var router6 = import_express12.default.Router();
-router6.get("/", getApplications);
-router6.post("/", upsertApplication);
-var applicationRoutes_default = router6;
+var router5 = import_express10.default.Router();
+router5.get("/", requireAuth, getApplications);
+router5.post("/", requireAuth, upsertApplication);
+var applicationRoutes_default = router5;
 
 // src/routes/mentorshipRoutes.ts
-var import_express14 = __toESM(require("express"));
+var import_express12 = __toESM(require("express"));
 
 // src/controllers/mentorshipController.ts
-var import_express13 = require("express");
+var import_express11 = require("express");
 var GUIDANCE_AMOUNT = parseInt(process.env.MENTORSHIP_FEE || "20000", 10) || 2e4;
 var GUIDANCE_CURRENCY = process.env.MENTORSHIP_CURRENCY || "NGN";
 var getMentorshipConfig = (_req, res) => {
@@ -2222,7 +2395,6 @@ var getMentorshipConfig = (_req, res) => {
 var createMentorshipRequest = async (req, res) => {
   try {
     const {
-      userId,
       userEmail,
       userName,
       opportunityId,
@@ -2235,14 +2407,34 @@ var createMentorshipRequest = async (req, res) => {
       currency,
       provider,
       reference,
-      status,
       note
     } = req.body || {};
-    if (!userId) {
-      return res.status(400).json({ success: false, error: "userId is required." });
-    }
+    const userId = req.authUser.uid;
     if (!reference) {
       return res.status(400).json({ success: false, error: "Payment reference is required." });
+    }
+    if (provider !== "paystack" && provider !== "demo") {
+      return res.status(400).json({ success: false, error: "Unknown payment provider." });
+    }
+    let status;
+    if (provider === "demo") {
+      status = "paid";
+    } else {
+      if (!process.env.PAYSTACK_SECRET_KEY) {
+        return res.status(400).json({
+          success: false,
+          error: "Card payments are not enabled yet. Please try again later."
+        });
+      }
+      status = "pending";
+    }
+    const expectedAmount = GUIDANCE_AMOUNT;
+    const finalAmount = Number(amount);
+    if (!Number.isFinite(finalAmount) || finalAmount < 0) {
+      return res.status(400).json({ success: false, error: "Invalid amount." });
+    }
+    if (finalAmount !== expectedAmount) {
+      status = "failed";
     }
     const record = await Mentorship_default.create({
       userId,
@@ -2254,8 +2446,8 @@ var createMentorshipRequest = async (req, res) => {
       opportunityUrl,
       opportunityType,
       opportunityCategory,
-      amount,
-      currency,
+      amount: finalAmount,
+      currency: currency || GUIDANCE_CURRENCY,
       provider,
       reference,
       status,
@@ -2279,9 +2471,8 @@ var createMentorshipRequest = async (req, res) => {
 };
 var getMentorships = async (req, res) => {
   try {
-    const { userId } = req.query;
-    if (!userId) return res.status(400).json({ success: false, error: "userId is required." });
-    const records = await Mentorship_default.find({ userId: String(userId) }).sort({ createdAt: -1 });
+    const userId = req.authUser.uid;
+    const records = await Mentorship_default.find({ userId }).sort({ createdAt: -1 });
     res.json({ success: true, count: records.length, data: records });
   } catch (error) {
     console.error("Failed to list mentorship requests:", error);
@@ -2290,49 +2481,24 @@ var getMentorships = async (req, res) => {
 };
 
 // src/routes/mentorshipRoutes.ts
-var router7 = import_express14.default.Router();
-router7.get("/config", getMentorshipConfig);
-router7.get("/", getMentorships);
-router7.post("/", createMentorshipRequest);
-var mentorshipRoutes_default = router7;
+var router6 = import_express12.default.Router();
+router6.get("/config", getMentorshipConfig);
+router6.get("/", requireAuth, getMentorships);
+router6.post("/", requireAuth, createMentorshipRequest);
+var mentorshipRoutes_default = router6;
 
 // src/routes/userRoutes.ts
-var import_express16 = __toESM(require("express"));
+var import_express14 = __toESM(require("express"));
 
 // src/controllers/userController.ts
-var import_express15 = require("express");
-
-// src/models/AppUser.ts
-var import_mongoose11 = __toESM(require("mongoose"));
-var AppUserSchema = new import_mongoose11.Schema(
-  {
-    uid: { type: String, required: true, unique: true, index: true },
-    email: { type: String, trim: true, lowercase: true },
-    displayName: { type: String, trim: true },
-    photoURL: { type: String },
-    role: { type: String, enum: ["user", "admin"], default: "user" },
-    mentorshipInterest: {
-      choice: { type: String, enum: ["yes", "no", null], default: null },
-      source: { type: String, enum: ["opportunity", "general"], default: "general" },
-      opportunityTitle: { type: String, default: "" },
-      opportunityUrl: { type: String, default: "" },
-      answeredAt: { type: Date }
-    }
-  },
-  { timestamps: true }
-);
-var AppUser_default = import_mongoose11.default.model("AppUser", AppUserSchema);
-
-// src/controllers/userController.ts
+var import_express13 = require("express");
 var ADMIN_UIDS = new Set(
   (process.env.ADMIN_UIDS || "").split(",").map((s) => s.trim()).filter(Boolean)
 );
 var syncUser = async (req, res) => {
   try {
-    const { uid, email, displayName, photoURL } = req.body || {};
-    if (!uid) {
-      return res.status(400).json({ success: false, error: "uid is required." });
-    }
+    const uid = req.authUser.uid;
+    const { email, displayName, photoURL } = req.body || {};
     const isFirstUser = await AppUser_default.countDocuments() === 0;
     const role = isFirstUser || ADMIN_UIDS.has(String(uid)) ? "admin" : "user";
     const user = await AppUser_default.findOneAndUpdate(
@@ -2376,9 +2542,8 @@ var syncUser = async (req, res) => {
 };
 var getUser = async (req, res) => {
   try {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ success: false, error: "uid is required." });
-    const user = await AppUser_default.findOne({ uid: String(uid) }).lean();
+    const uid = req.authUser.uid;
+    const user = await AppUser_default.findOne({ uid }).lean();
     res.json({
       success: true,
       user: user ? { uid: user.uid, email: user.email, displayName: user.displayName, role: user.role } : null
@@ -2390,8 +2555,8 @@ var getUser = async (req, res) => {
 };
 var recordMentorshipInterest = async (req, res) => {
   try {
-    const { uid, choice, source, opportunityTitle, opportunityUrl } = req.body || {};
-    if (!uid) return res.status(400).json({ success: false, error: "uid is required." });
+    const uid = req.authUser.uid;
+    const { choice, source, opportunityTitle, opportunityUrl } = req.body || {};
     if (choice !== "yes" && choice !== "no") {
       return res.status(400).json({ success: false, error: 'choice must be "yes" or "no".' });
     }
@@ -2419,45 +2584,33 @@ var recordMentorshipInterest = async (req, res) => {
 };
 
 // src/routes/userRoutes.ts
-var router8 = import_express16.default.Router();
-router8.post("/", syncUser);
-router8.get("/", getUser);
-router8.post("/mentorship-interest", recordMentorshipInterest);
-var userRoutes_default = router8;
+var router7 = import_express14.default.Router();
+router7.post("/", requireAuth, syncUser);
+router7.get("/", requireAuth, getUser);
+router7.post("/mentorship-interest", requireAuth, recordMentorshipInterest);
+var userRoutes_default = router7;
 
 // src/routes/adminRoutes.ts
-var import_express18 = __toESM(require("express"));
+var import_express16 = __toESM(require("express"));
 
 // src/controllers/adminController.ts
-var import_express17 = require("express");
+var import_express15 = require("express");
 var import_mongoose12 = require("mongoose");
 var PLATFORM_CUT = 0.1;
-var requireAdmin = async (req, res, next) => {
-  try {
-    const uid = String(req.headers["x-user-uid"] || "");
-    if (!uid) {
-      return res.status(401).json({ success: false, error: "Authentication required." });
-    }
-    const user = await AppUser_default.findOne({ uid });
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, error: "Admin access only." });
-    }
-    return next();
-  } catch (error) {
-    console.error("requireAdmin error:", error);
-    return res.status(500).json({ success: false, error: "Server error." });
-  }
-};
 var getOverview = async (_req, res) => {
   try {
-    const [totalUsers, totalMentors, pendingMentorApplications, totalMentees, paidRequests] = await Promise.all([
+    const [totalUsers, totalMentors, pendingMentorApplications, totalMentees, revenueAgg] = await Promise.all([
       AppUser_default.countDocuments(),
       Mentor_default.countDocuments({ status: "approved" }),
       Mentor_default.countDocuments({ status: "pending" }),
       Mentorship_default.countDocuments({ status: "paid", mentorId: { $ne: null } }),
-      Mentorship_default.find({ status: "paid" }).lean()
+      Mentorship_default.aggregate([
+        { $match: { status: "paid" } },
+        { $group: { _id: null, gross: { $sum: { $ifNull: ["$amount", 0] } }, count: { $sum: 1 } } }
+      ])
     ]);
-    const grossRevenue = paidRequests.reduce((sum, m) => sum + (m.amount || 0), 0);
+    const grossRevenue = revenueAgg[0]?.gross ?? 0;
+    const paidMenteeCount = revenueAgg[0]?.count ?? 0;
     res.json({
       success: true,
       totalUsers,
@@ -2497,27 +2650,28 @@ var listUsers = async (_req, res) => {
 var listMentors = async (_req, res) => {
   try {
     const mentors = await Mentor_default.find().sort({ createdAt: -1 }).lean();
-    const results = await Promise.all(
-      mentors.map(async (m) => {
-        const [menteesCount, paid] = await Promise.all([
-          Mentorship_default.countDocuments({ mentorId: m.userId, status: "paid" }),
-          Mentorship_default.find({ mentorId: m.userId, status: "paid" }).lean()
-        ]);
-        const gross = paid.reduce((sum, r) => sum + (r.amount || 0), 0);
-        return {
-          userId: m.userId,
-          name: m.name,
-          email: m.email,
-          company: m.company,
-          roleType: m.roleType,
-          careerStory: m.careerStory,
-          status: m.status,
-          menteesCount,
-          accountBalance: gross * (1 - PLATFORM_CUT),
-          createdAt: m.createdAt
-        };
-      })
-    );
+    const stats = await Mentorship_default.aggregate([
+      { $match: { status: "paid", mentorId: { $ne: null } } },
+      { $group: { _id: "$mentorId", total: { $sum: 1 }, gross: { $sum: { $ifNull: ["$amount", 0] } } } }
+    ]);
+    const statsByMentor = new Map(stats.map((s) => [s._id, s]));
+    const results = mentors.map((m) => {
+      const stat = statsByMentor.get(m.userId);
+      const menteesCount = stat?.total ?? 0;
+      const gross = stat?.gross ?? 0;
+      return {
+        userId: m.userId,
+        name: m.name,
+        email: m.email,
+        company: m.company,
+        roleType: m.roleType,
+        careerStory: m.careerStory,
+        status: m.status,
+        menteesCount,
+        accountBalance: gross * (1 - PLATFORM_CUT),
+        createdAt: m.createdAt
+      };
+    });
     res.json({ success: true, mentors: results });
   } catch (error) {
     console.error("Failed to list mentors:", error);
@@ -2635,55 +2789,81 @@ var reviewMentorApplication = async (req, res) => {
 };
 
 // src/routes/adminRoutes.ts
-var router9 = import_express18.default.Router();
-router9.use(requireAdmin);
-router9.get("/overview", getOverview);
-router9.get("/users", listUsers);
-router9.get("/mentors", listMentors);
-router9.get("/mentees", listMentees);
-router9.get("/complaints", listComplaints);
-router9.get("/launch", getAdminLaunch);
-router9.post("/launch/state", setLaunchState);
-router9.post("/launch/timer", setLaunchTimer);
-router9.post("/launch/whatsapp", setWhatsappGroup);
-router9.post("/users/:uid/promote", promoteUser);
-router9.post("/mentors/:uid/:action", reviewMentorApplication);
-router9.post("/complaints/:id/resolve", resolveComplaint);
-var adminRoutes_default = router9;
+var router8 = import_express16.default.Router();
+router8.use(requireAdmin);
+router8.get("/overview", getOverview);
+router8.get("/users", listUsers);
+router8.get("/mentors", listMentors);
+router8.get("/mentees", listMentees);
+router8.get("/complaints", listComplaints);
+router8.get("/launch", getAdminLaunch);
+router8.post("/launch/state", setLaunchState);
+router8.post("/launch/timer", setLaunchTimer);
+router8.post("/launch/whatsapp", setWhatsappGroup);
+router8.post("/users/:uid/promote", promoteUser);
+router8.post("/mentors/:uid/:action", reviewMentorApplication);
+router8.post("/complaints/:id/resolve", resolveComplaint);
+var adminRoutes_default = router8;
 
 // src/routes/launchRoutes.ts
-var import_express19 = __toESM(require("express"));
-var router10 = import_express19.default.Router();
-router10.get("/status", getLaunchStatus);
-router10.post("/waitlist", joinWaitlist);
-var launchRoutes_default = router10;
+var import_express17 = __toESM(require("express"));
+var router9 = import_express17.default.Router();
+router9.get("/status", getLaunchStatus);
+router9.post("/waitlist", joinWaitlist);
+var launchRoutes_default = router9;
 
 // src/index.ts
-var app = (0, import_express20.default)();
+var app2 = (0, import_express18.default)();
 var port = process.env.PORT || 5e3;
-app.use(
+app2.set("trust proxy", 1);
+app2.use((0, import_helmet.default)());
+var defaultOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
+var configuredOrigins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
+var allowedOrigins = configuredOrigins.length > 0 ? configuredOrigins : defaultOrigins;
+var isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+app2.use(
   (0, import_cors.default)({
-    // Comma-separated list of allowed origins, e.g. CORS_ORIGIN=https://app.example.com,http://localhost:5173
-    // Leave unset (or CORS_ORIGIN=*) to allow all origins.
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean) : true
+    origin: (origin, cb) => {
+      if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin) || isLocalhost.test(origin)) {
+        return cb(null, true);
+      }
+      return cb(new Error("Not allowed by CORS"));
+    }
   })
 );
-app.use(import_express20.default.json());
-app.get("/api/health", (req, res) => {
+app2.use(import_express18.default.json({ limit: "1mb" }));
+app2.use("/api", apiLimiter);
+app2.use("/api/ai/chat", strictLimiter);
+app2.use("/api/sync", sensitiveLimiter);
+app2.get("/api/health", (req, res) => {
   res.json({ status: "ok", message: "Opportunity Radar API is running" });
 });
-app.use("/api/opportunities", opportunityRoutes_default);
-app.use("/api/auth", authRoutes_default);
-app.use("/api/ai", aiRoutes_default);
-app.use("/api/mentors", mentorRoutes_default);
-app.use("/api/sync", syncRoutes_default);
-app.use("/api/applications", applicationRoutes_default);
-app.use("/api/mentorships", mentorshipRoutes_default);
-app.use("/api/users", userRoutes_default);
-app.use("/api/admin", adminRoutes_default);
-app.use("/api/launch", launchRoutes_default);
+app2.use("/api/opportunities", opportunityRoutes_default);
+app2.use("/api/ai", aiRoutes_default);
+app2.use("/api/mentors", mentorRoutes_default);
+app2.use("/api/sync", syncRoutes_default);
+app2.use("/api/applications", applicationRoutes_default);
+app2.use("/api/mentorships", mentorshipRoutes_default);
+app2.use("/api/users", userRoutes_default);
+app2.use("/api/admin", adminRoutes_default);
+app2.use("/api/launch", launchRoutes_default);
+app2.use((err, _req, res, _next) => {
+  if (err instanceof import_multer2.default.MulterError) {
+    const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
+    const message = err.code === "LIMIT_FILE_SIZE" ? "File is too large. Maximum allowed size is 5MB." : "Invalid file upload.";
+    return res.status(status).json({ success: false, message });
+  }
+  if (err instanceof Error && err.message === "Only PDF files are allowed") {
+    return res.status(400).json({ success: false, message: "Only PDF files are allowed." });
+  }
+  if (err.message === "Not allowed by CORS") {
+    return res.status(403).json({ success: false, error: "Origin not allowed." });
+  }
+  console.error("Unhandled error:", err);
+  return res.status(500).json({ success: false, error: "Internal server error." });
+});
 var mongoUri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/opportunity-radar";
-app.listen(port, () => {
+app2.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
 var scheduleOpportunitySync = () => {
@@ -2693,19 +2873,19 @@ var scheduleOpportunitySync = () => {
   import_node_cron.default.schedule(cronExpression, async () => {
     console.log("[sync] Starting scheduled opportunity sync...");
     try {
-      const result = await runOpportunitySync();
-      console.log("[sync] Scheduled sync complete:", JSON.stringify(result));
+      const result = await withLock("opportunity-sync", 45 * 60 * 1e3, runOpportunitySync);
+      if (result) console.log("[sync] Scheduled sync complete:", JSON.stringify(result));
     } catch (error) {
       console.error("[sync] Scheduled sync failed:", error);
     }
   });
   console.log("[sync] Running initial opportunity sync at boot...");
-  runOpportunitySync().then((result) => console.log("[sync] Initial sync complete:", JSON.stringify(result))).catch((error) => console.error("[sync] Initial sync failed:", error));
+  withLock("opportunity-sync", 45 * 60 * 1e3, runOpportunitySync).then((result) => result && console.log("[sync] Initial sync complete:", JSON.stringify(result))).catch((error) => console.error("[sync] Initial sync failed:", error));
 };
 var scheduleLaunchCheck = () => {
   import_node_cron.default.schedule("*/1 * * * *", async () => {
     try {
-      const config = await autoLaunchIfDue();
+      const config = await withLock("auto-launch-check", 60 * 1e3, autoLaunchIfDue);
       if (config?.launched) {
         console.log("[launch] App auto-launched (countdown elapsed).");
       }

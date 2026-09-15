@@ -138,6 +138,9 @@ OpportunitySchema.index({ deadline: 1 });
 OpportunitySchema.index({ eligibleEducationLevels: 1 });
 OpportunitySchema.index({ eligibleFields: 1 });
 OpportunitySchema.index({ eligibleCountries: 1 });
+// Feeds sort by status then priority/discovery date; dedupe/search by URL.
+OpportunitySchema.index({ officialUrl: 1 });
+OpportunitySchema.index({ status: 1, priorityScore: -1, dateDiscovered: -1 });
 
 // Full-text search index
 OpportunitySchema.index({

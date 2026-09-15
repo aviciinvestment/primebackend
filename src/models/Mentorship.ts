@@ -45,4 +45,10 @@ const MentorshipSchema: Schema = new Schema(
   { timestamps: true }
 );
 
+// Admin overviews / mentor dashboards and mentor-load scoring query by status
+// and mentorId heavily.
+MentorshipSchema.index({ status: 1 });
+MentorshipSchema.index({ status: 1, mentorId: 1 });
+MentorshipSchema.index({ mentorId: 1, status: 1 });
+
 export default mongoose.model<IMentorship>('Mentorship', MentorshipSchema);

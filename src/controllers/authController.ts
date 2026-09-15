@@ -3,6 +3,16 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import User from '../models/User';
 
+// Legacy email/password auth is no longer wired into the app (the client
+// authenticates via Firebase). If anything still calls this it must have an
+// explicit JWT_SECRET — never a hard-coded fallback.
+const requireJwtSecret = (): string => {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET is not configured.');
+  }
+  return process.env.JWT_SECRET;
+};
+
 export const registerUser = async (req: Request, res: Response) => {
   try {
     const { email, password, firstName, lastName } = req.body;
@@ -22,7 +32,7 @@ export const registerUser = async (req: Request, res: Response) => {
       lastName
     });
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', {
+    const token = jwt.sign({ id: user._id }, requireJwtSecret(), {
       expiresIn: '30d'
     });
 
@@ -56,7 +66,7 @@ export const loginUser = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', {
+    const token = jwt.sign({ id: user._id }, requireJwtSecret(), {
       expiresIn: '30d'
     });
 

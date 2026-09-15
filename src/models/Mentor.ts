@@ -25,4 +25,7 @@ const MentorSchema: Schema = new Schema(
   { timestamps: true }
 );
 
+// Admin dashboard filters by pending/approved.
+MentorSchema.index({ status: 1 });
+
 export default mongoose.model<IMentor>('Mentor', MentorSchema);

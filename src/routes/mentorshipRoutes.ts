@@ -4,11 +4,12 @@ import {
   createMentorshipRequest,
   getMentorships,
 } from '../controllers/mentorshipController';
+import { requireAuth } from '../middleware/auth';
 
 const router = express.Router();
 
 router.get('/config', getMentorshipConfig);
-router.get('/', getMentorships);
-router.post('/', createMentorshipRequest);
+router.get('/', requireAuth, getMentorships);
+router.post('/', requireAuth, createMentorshipRequest);
 
 export default router;
