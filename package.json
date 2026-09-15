@@ -1,20 +1,22 @@
 {
   "name": "server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "PrimeOpportunity API server",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "seed": "tsx src/scripts/seedDatabase.ts",
     "seed:vector": "tsx src/scripts/seedVectorDB.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "esbuild src/index.ts --bundle --platform=node --packages=external --target=node18 --outfile=dist/index.js",
+    "start": "node dist/index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@pinecone-database/pinecone": "^4.0.0",
+    "@types/node-cron": "^3.0.11",
+    "axios": "^1.20.0",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
@@ -24,9 +26,10 @@
     "mongoose": "^9.10.0",
     "morgan": "^1.12.1",
     "multer": "^1.4.5-lts.1",
+    "node-cron": "^3.0.3",
     "openai": "^4.70.2",
     "pdf-parse": "^1.1.1",
-    "@pinecone-database/pinecone": "^4.0.0"
+    "rss-parser": "^3.13.0"
   },
   "devDependencies": {
     "@types/bcrypt": "^6.0.0",
@@ -34,12 +37,13 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/mongoose": "^5.11.96",
+    "@types/multer": "^1.4.12",
     "@types/node": "^26.5.1",
+    "@types/pdf-parse": "^1.1.4",
+    "esbuild": "^0.28.2",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.13",
-    "typescript": "^7.0.2",
-    "@types/multer": "^1.4.12",
-    "@types/pdf-parse": "^1.1.4"
+    "typescript": "^7.0.2"
   }
 }

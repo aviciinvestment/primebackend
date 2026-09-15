@@ -59,6 +59,7 @@ export interface IOpportunity extends Document {
   priorityScore: number;
   tags: string[];
   isAiDiscovered: boolean;
+  vectorized: boolean;
 }
 
 const OpportunitySchema: Schema = new Schema(
@@ -123,7 +124,10 @@ const OpportunitySchema: Schema = new Schema(
     
     priorityScore: { type: Number, default: 0 },
     tags: [{ type: String }],
-    isAiDiscovered: { type: Boolean, default: false }
+    isAiDiscovered: { type: Boolean, default: false },
+    // True once this opportunity's vector exists in Pinecone. Lets the sync
+    // embed only new/changed docs instead of re-embedding everything.
+    vectorized: { type: Boolean, default: false }
   },
   { timestamps: true }
 );

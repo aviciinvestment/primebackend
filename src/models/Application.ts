@@ -1,41 +1,41 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
+export type ApplicationStatus =
+  | 'saved'
+  | 'applied'
+  | 'interview'
+  | 'accepted'
+  | 'rejected';
+
 export interface IApplication extends Document {
+  // Firebase UID (string), matching the Cv model's per-user convention.
+  userId: string;
   opportunityId: mongoose.Types.ObjectId;
-  userId: mongoose.Types.ObjectId;
+  status: ApplicationStatus;
+  // True once the user has opened the opportunity's link at least once — used
+  // by the dashboard to show a "visited" differentiator.
+  clicked: boolean;
+  clickedAt?: Date;
   dateApplied?: Date;
-  status: 'Interested' | 'Saved' | 'Planning to Apply' | 'Applied' | 'Assessment' | 'Interview' | 'Final Stage' | 'Accepted' | 'Rejected' | 'Withdrawn' | 'Expired';
-  applicationNotes?: string;
-  documentsUsed: string[];
-  cvVersion?: string;
-  coverLetter?: string;
-  applicationUrl?: string;
-  nextAction?: string;
-  nextActionDate?: Date;
 }
 
 const ApplicationSchema: Schema = new Schema(
   {
+    userId: { type: String, required: true, index: true },
     opportunityId: { type: Schema.Types.ObjectId, ref: 'Opportunity', required: true },
-    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-    dateApplied: { type: Date },
-    status: { 
-      type: String, 
-      enum: ['Interested', 'Saved', 'Planning to Apply', 'Applied', 'Assessment', 'Interview', 'Final Stage', 'Accepted', 'Rejected', 'Withdrawn', 'Expired'],
-      default: 'Saved'
+    status: {
+      type: String,
+      enum: ['saved', 'applied', 'interview', 'accepted', 'rejected'],
+      default: 'saved',
     },
-    applicationNotes: { type: String },
-    documentsUsed: [{ type: String }],
-    cvVersion: { type: String },
-    coverLetter: { type: String },
-    applicationUrl: { type: String },
-    nextAction: { type: String },
-    nextActionDate: { type: Date }
+    clicked: { type: Boolean, default: false },
+    clickedAt: { type: Date },
+    dateApplied: { type: Date },
   },
   { timestamps: true }
 );
 
-// Unique compound index so a user can only have one application record per opportunity
+// Unique compound index so a user can only have one record per opportunity.
 ApplicationSchema.index({ opportunityId: 1, userId: 1 }, { unique: true });
 
 export default mongoose.model<IApplication>('Application', ApplicationSchema);

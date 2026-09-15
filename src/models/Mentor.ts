@@ -7,6 +7,7 @@ export interface IMentor extends Document {
   company: string;
   roleType: string;
   careerStory: string;
+  status: 'pending' | 'approved' | 'rejected';
   createdAt: Date;
   updatedAt: Date;
 }
@@ -19,6 +20,7 @@ const MentorSchema: Schema = new Schema(
     company: { type: String, required: true, trim: true },
     roleType: { type: String, required: true, trim: true },
     careerStory: { type: String, required: true, trim: true },
+    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
   },
   { timestamps: true }
 );

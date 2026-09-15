@@ -5,6 +5,8 @@ import { Pinecone } from '@pinecone-database/pinecone';
 import OpenAI from 'openai';
 import Opportunity from '../models/Opportunity';
 import Cv from '../models/Cv';
+import Mentorship from '../models/Mentorship';
+import MentorshipComplaint from '../models/MentorshipComplaint';
 
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY! });
 const INDEX_NAME = 'prime-opportunity-index';
@@ -25,6 +27,112 @@ const nvidiaChatClient = new OpenAI({
 // This guarantees a chat query can never retrieve another user's CV data,
 // even if a malicious request is made.
 const CV_NAMESPACE_PREFIX = 'cvs-';
+
+// The exact refusal message used when a user asks something outside the
+// platform's scope. Must stay in sync with the system prompt string below.
+const OFF_TOPIC_REFUSAL =
+  "I don't have information on that in this jurisdiction. I can only help you with scholarships, internships, graduate trainee programmes, and fellowships on PrimeOpportunity.";
+
+// Deterministic guardrail: questions matching any of these clearly
+// out-of-scope patterns are refused without calling the LLM at all.
+const OFF_TOPIC_PATTERNS: RegExp[] = [
+  /hack (into|his|her|their|my)|crack (a )?password|break into (an?|the|my|someone'?s) (account|phone|computer|pc|system)|create (a )?virus|malware|phishing/i,
+  /medical advice|diagnos[ei] my|my sympto|prescription for|medication for|dosage|cure (my|for)|treat(ment)? for/i,
+  /my (boyfriend|girlfriend)|how to (flirt|date|get a girlfriend|get a boyfriend)|dating (tips|advice)|relationship (advice|problem)s?/i,
+  /pray (to|for)|bible verse|quran[^ ]* verse|sermon|religious (question|advice)|my church/i,
+  /political party|election (results|predictions)|vote for (a )?party/i,
+  /betting (tips|tricks)|sports betting|casino|jackpot|lottery (numbers|tickets)|bitcoin|cryptocurrenc|forex (trading)?|stock (tips|market predictions)|compound (a )?bomb/i,
+  /tell (me|us) a joke|make (me|us) laugh|roast me|movie (recommendation|suggestion|plot)|music (recommendation|suggestion)|game (cheats|walkthrough|hacks)|how to (win|beat) (fortnite|a game)/i,
+  /recipe for|how to (cook|bake|make) (a |an |some )?(meal|dish|cake|pasta|soup)/i,
+  /horoscop|tarot|astrolog|fortune tell(er|ing)?|dream meaning|palm reading|zodiac sign/i,
+  /solve (this|my) (math|physics|chemistry) (problem|question)|homework (help|answer)|write (an essay|a poem|a story|a song|a rap|a letter) (about|for)|essay about|poem about|translate (this |the )?(to|into) (french|spanish|german)/i,
+];
+
+const isOffTopic = (message: string): boolean => {
+  const text = ` ${message.toLowerCase()} `;
+  return OFF_TOPIC_PATTERNS.some(pattern => pattern.test(text));
+};
+
+// ---- Chat action detection -----------------------------------------------
+// Two deterministic intents are handled WITHOUT an LLM call so their behaviour
+// never varies:
+//  1. Mentorship request  -> the client shows a link to the purchase page.
+//  2. Paid-but-no-mentor  -> the message is escalated to an admin with the
+//                            user's account details attached.
+
+const MENTORSHIP_INTENT_PATTERNS: RegExp[] = [
+  /\bneed (a |some |any )?(mentor|mentorship|guidance)\b/i,
+  /\bwant (a |to (get|buy|purchase|access|have|use|sign up for) |some )?(mentor|mentorship)\b/i,
+  /\bget (a |me )?(mentor|mentorship)\b/i,
+  /\b(how|where) (do|can|should) (i|me) (get|buy|purchase|access|find) (a )?(mentor|mentorship)\b/i,
+  /\b(pay|buy|purchase|paying|subscribe|sign up) (for |to |some )?(a )?(mentor|mentorship)\b/i,
+  /\b(mentor|mentorship) (me|to help me|for me,? please|please|guidance, please)\b/i,
+  /\b(am|i.?m|i am) (looking for|searching for|interested in) (a )?(mentor|mentorship)\b/i,
+  /\bmentorship\b/i,
+  /\bguide me through (an? )?(application|opportunity)/i,
+];
+
+const MENTORSHIP_COMPLAINT_PATTERNS: RegExp[] = [
+  /\bpaid\b[^.!?\n]{0,120}\b(?:but|yet|however|still)\b[^.!?\n]{0,80}\b(?:no|not|never|nothing|still|yet)\b[^.!?\n]{0,60}\b(?:mentor|guidance|assigned|matched|reviewed|contacted)\b/i,
+  /\b(?:no|not|never|nothing|still|yet)\b[^.!?\n]{0,80}\b(?:mentor|guidance|assigned|matched|reviewed)\b[^.!?\n]{0,80}\b(?:paid|payment|money|since)\b/i,
+  /\bh[ae]vent\b[^.!?\n]{0,40}\b(?:been )?(?:given|assigned|allocated|matched|received|gotten|seen)\b[^.!?\n]{0,50}\b(?:mentor|guidance)\b/i,
+  /\b(?:given|assigned|allocated|matched|attached)\b[^.!?\n]{0,40}\b(?:no|not|never)\b[^.!?\n]{0,40}\b(?:mentor|guidance)\b/i,
+  /\b(?:mentor|guidance|mentor is)\b[^.!?\n]{0,60}\b(?:not|no|never|still|yet|awaiting|pending)\b[^.!?\n]{0,60}\b(?:paid|payment|money)\b/i,
+  /\bnot given a mentor\b|\bstill (?:haven.?t|didn.?t) (?:gotten|received|seen) (?:a |my )?mentor\b|\bno mentor (yet|still|assigned)?\b/i,
+  /\b(?:yet to|not yet|haven.?t|h[ae]vent|still waiting|not received|no response|no feedback|no one)\b[^.!?\n]{0,100}\b(?:mentor|guidance|mentorship)\b/i,
+  /\bcomplaint\b[^.!?\n]{0,140}\b(?:mentor|mentorship|paid|payment)\b/i,
+  /\b(fraud|scam|ripped off|took my money)\b/i,
+];
+
+const hasMentorshipIntent = (message: string): boolean =>
+  MENTORSHIP_INTENT_PATTERNS.some(pattern => pattern.test(message));
+
+const hasMentorshipComplaint = (message: string): boolean =>
+  MENTORSHIP_COMPLAINT_PATTERNS.some(pattern => pattern.test(message));
+
+const makeTicket = (): string => {
+  const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
+  return `TKT-${Date.now().toString(36).toUpperCase()}-${suffix}`;
+};
+
+// "I paid but no mentor" -> store the report for admins and return a ticket.
+const handleMentorshipComplaint = async (message: string, userId: string, userEmail: string, userName: string): Promise<string> => {
+  const ticket = makeTicket();
+  try {
+    let payments: Array<{ reference: string; amount: number; currency: string; mentorName: string; createdAt: Date }> = [];
+    if (userId) {
+      const paidRecords = await Mentorship.find({ userId, status: 'paid' })
+        .select('reference amount currency mentorName createdAt')
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean();
+      payments = paidRecords.map(r => ({
+        reference: r.reference,
+        amount: r.amount,
+        currency: r.currency,
+        mentorName: r.mentorName || '',
+        createdAt: r.createdAt,
+      }));
+    }
+
+    await MentorshipComplaint.create({
+      ticket,
+      userId,
+      userEmail,
+      userName,
+      message: message.slice(0, 2000),
+      payments,
+    });
+    console.log(`AI chat escalated complaint ${ticket} from user "${userName}" (${userEmail || userId || 'guest'}) to admins.`);
+  } catch (err) {
+    console.error('Failed to persist mentorship complaint:', err);
+  }
+  return (
+    `I'm sorry to hear that — you should already have a mentor after paying.\n\n` +
+    `I've sent your message straight to our admin team along with your account details (email: ${userEmail || 'not provided'}). You don't need to do anything else; someone will follow up on your payment and assign a mentor as soon as possible.\n\n` +
+    `Your ticket number is **${ticket}** — you can reference it if you reach out again.`
+  );
+};
 
 const chunkText = (text: string, chunkSize = 1000, overlap = 150): string[] => {
   const clean = text.trim();
@@ -52,8 +160,8 @@ const namespace = `${CV_NAMESPACE_PREFIX}${userId}`;
 
   // Delete this user's previous CV vectors (refreshes their private namespace).
   // The namespace may not exist yet on first upload — that is fine, skip it.
-  try {
-    await index.deleteAll({ namespace });
+try {
+    await index.namespace(namespace).deleteAll();
   } catch (err: any) {
     if (err?.name !== 'PineconeNotFoundError') {
       throw err;
@@ -79,7 +187,7 @@ const namespace = `${CV_NAMESPACE_PREFIX}${userId}`;
     },
   }));
 
-  await index.upsert({ namespace, records: vectors });
+  await index.namespace(namespace).upsert(vectors);
   return { namespace, chunks: vectors.length };
 };
 
@@ -215,9 +323,45 @@ export const chatWithAI = async (req: Request, res: Response) => {
       .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
       .slice(-10);
 
-    // The chat is only ever personalized with the requesting user's own CV.
+// The chat is only ever personalized with the requesting user's own CV.
     // userId scope is enforced by querying ONLY that user's private Pinecone namespace.
     const userId = (req.body.userId as string || '').trim();
+
+    // Hard guardrail: refuse clearly out-of-scope questions without an LLM call.
+    if (isOffTopic(message)) {
+      res.json({ success: true, reply: OFF_TOPIC_REFUSAL });
+      return;
+    }
+
+    // Check complaints BEFORE the mentorship-intent catch-all, so a message like
+    // "I paid for mentorship but no mentor yet" escalates to admins instead of
+    // being treated as a new purchase request.
+    if (hasMentorshipComplaint(message)) {
+      const reply = await handleMentorshipComplaint(
+        message,
+        userId,
+        (req.body.userEmail as string || '').trim(),
+        (req.body.userName as string || '').trim()
+      );
+      res.json({ success: true, reply });
+      return;
+    }
+
+    // Mentorship request -> deterministic reply with an in-chat link to the
+    // purchase/guidance page (client renders the clickable action button).
+    if (hasMentorshipIntent(message)) {
+      const fee = parseInt(process.env.MENTORSHIP_FEE || '20000', 10) || 20000;
+      const currency = process.env.MENTORSHIP_CURRENCY || 'NGN';
+      res.json({
+        success: true,
+        action: { type: 'mentorship' },
+        reply:
+          'Great choice! Our **mentorship guidance** pairs you with an industry mentor who reviews your applications, coaches you, and boosts your chances of getting in.\n\n' +
+          `It costs **${currency} ${fee.toLocaleString()}** per opportunity and you can pay securely right from the page.\n\n` +
+          'Click the button below to get started.',
+      });
+      return;
+    }
 
     // 1. Generate Embedding for the user's message
     const embedResponse = await nvidiaEmbedClient.embeddings.create({
@@ -336,6 +480,12 @@ PRIVACY RULES (STRICT):
 - The USER'S OWN CV PROFILE belongs solely to the current user. You must NEVER claim to know the details, CV, or personal information of any other user.
 - Never reveal, repeat, or export raw CV information in a way that could be shared with others; summarize it only for the user who owns it.
 - If asked about another person's CV or data, politely decline.
+
+SCOPE GUARDRAIL (STRICT — NEVER BREAK):
+- You may ONLY answer questions related to PrimeOpportunity and its content: discovering and applying for scholarships, internships, graduate trainee programmes, and fellowships for Nigerian students and early-career professionals; platform features (search, filters, sort, CV upload, CV Match, login, account); and personalized advice based on the user's OWN CV so long as it stays relevant to those opportunities.
+- If the user asks about anything outside that scope — general knowledge, schoolwork, medical, legal, financial/investment, political, religious, relationship, entertainment, recipes, sports, tech/coding, current events, or ANY topic unrelated to the platform — you MUST NOT answer it or add any extra detail.
+- In that case, reply with EXACTLY this message and nothing else: "${OFF_TOPIC_REFUSAL}"
+- When in doubt, refuse with that exact message. Never improvise an answer outside the platform's scope.
 
 USER'S OWN CV PROFILE:
 ${userCvContext || 'The current user has not uploaded a CV yet (or none is vectorized). Do not claim you can see their CV.'}

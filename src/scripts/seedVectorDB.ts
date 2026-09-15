@@ -108,7 +108,7 @@ async function seedVectorDB() {
         });
       }
       
-      await index.upsert({ records: vectors });
+      await index.upsert(vectors);
       console.log(`Upserted ${vectors.length} vectors.`);
     }
 
