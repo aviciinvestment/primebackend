@@ -75,11 +75,18 @@ async function completeChat(
         temperature: opts.temperature ?? 0.6,
         top_p: 0.95,
         max_tokens: opts.maxTokens ?? 700,
-        stream: false,
+        // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
+        // reasoning models when stream:false is used. Streaming is the only
+        // reliable mode, so ALWAYS request a stream and accumulate the deltas.
+        stream: true,
         timeout: LLM_ATTEMPT_TIMEOUT_MS,
         maxRetries: 0,
       });
-      const content = completion.choices[0]?.message?.content || '';
+      let content = '';
+      for await (const chunk of completion) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) content += delta;
+      }
       if (content.trim()) return { content, model };
       failures.push(`${model} -> empty completion`);
     } catch (err: any) {
