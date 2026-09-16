@@ -61,6 +61,22 @@ const chatModelAttempts = (): LlmAttempt[] => [
   { client: nvidiaChatClient2, model: 'meta/muse-glimmer-30b' },
 ];
 
+// Best-effort extraction of the REAL failure detail from a failed LLM call.
+// The OpenAI SDK often reports just "400 status code (no body)" — that text
+// hides NVIDIA's actual error, so dig the raw response body/status/headers out
+// and surface them (truncated). Keeps the failure note actionable in the UI.
+const describeLlmError = (err: any): string => {
+  const status = err?.status ? `HTTP ${err.status}` : 'NO_STATUS';
+  let body = '';
+  try {
+    if (typeof err?.body === 'string') body = err.body;
+    else if (err?.body) body = JSON.stringify(err.body);
+  } catch { body = ''; }
+  if (!body && err?.message) body = err.message;
+  const extra = err?.code ? ` code=${err.code}` : '';
+  return `${status}${extra} ${String(body).slice(0, 400)}`.trim();
+};
+
 async function completeChat(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   opts: { temperature?: number; maxTokens?: number } = {}
@@ -87,11 +103,15 @@ async function completeChat(
         const delta = chunk.choices?.[0]?.delta?.content;
         if (delta) content += delta;
       }
-      if (content.trim()) return { content, model };
+      if (content.trim()) {
+        console.log(`LLM OK via ${model}`);
+        return { content, model };
+      }
       failures.push(`${model} -> empty completion`);
     } catch (err: any) {
-      failures.push(`${model} -> ${err?.message || err}`);
-      console.warn(`LLM model ${model} failed, trying next candidate: ${err?.message || err}`);
+      const detail = describeLlmError(err);
+      failures.push(`${model} -> ${detail}`);
+      console.warn(`LLM model ${model} failed, trying next candidate: ${detail}`);
     }
   }
   throw new Error(failures.join(' | ') || 'All configured LLM providers failed.');
@@ -737,7 +757,7 @@ export const chatWithAI = async (req: Request, res: Response) => {
           }
           break;
         } catch (err: any) {
-          console.warn(`Chat stream model ${attempt.model} failed: ${err?.message || err}`);
+          console.warn(`Chat stream model ${attempt.model} failed: ${describeLlmError(err)}`);
         }
       }
       if (!streamed) {

@@ -1982,6 +1982,19 @@ var chatModelAttempts = () => [
   { client: nvidiaChatClient, model: "deepseek-ai/deepseek-v4-flash-0731" },
   { client: nvidiaChatClient2, model: "meta/muse-glimmer-30b" }
 ];
+var describeLlmError = (err) => {
+  const status = err?.status ? `HTTP ${err.status}` : "NO_STATUS";
+  let body = "";
+  try {
+    if (typeof err?.body === "string") body = err.body;
+    else if (err?.body) body = JSON.stringify(err.body);
+  } catch {
+    body = "";
+  }
+  if (!body && err?.message) body = err.message;
+  const extra = err?.code ? ` code=${err.code}` : "";
+  return `${status}${extra} ${String(body).slice(0, 400)}`.trim();
+};
 async function completeChat(messages, opts = {}) {
   const failures = [];
   for (const attempt of chatModelAttempts()) {
@@ -2005,11 +2018,15 @@ async function completeChat(messages, opts = {}) {
         const delta = chunk.choices?.[0]?.delta?.content;
         if (delta) content += delta;
       }
-      if (content.trim()) return { content, model: model2 };
+      if (content.trim()) {
+        console.log(`LLM OK via ${model2}`);
+        return { content, model: model2 };
+      }
       failures.push(`${model2} -> empty completion`);
     } catch (err) {
-      failures.push(`${model2} -> ${err?.message || err}`);
-      console.warn(`LLM model ${model2} failed, trying next candidate: ${err?.message || err}`);
+      const detail = describeLlmError(err);
+      failures.push(`${model2} -> ${detail}`);
+      console.warn(`LLM model ${model2} failed, trying next candidate: ${detail}`);
     }
   }
   throw new Error(failures.join(" | ") || "All configured LLM providers failed.");
@@ -2435,7 +2452,7 @@ var chatWithAI = async (req, res) => {
           }
           break;
         } catch (err) {
-          console.warn(`Chat stream model ${attempt.model} failed: ${err?.message || err}`);
+          console.warn(`Chat stream model ${attempt.model} failed: ${describeLlmError(err)}`);
         }
       }
       if (!streamed) {
