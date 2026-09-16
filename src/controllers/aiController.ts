@@ -36,27 +36,40 @@ const nvidiaChatClient = new OpenAI({
   maxRetries: 1,
 });
 
-// NVIDIA-hosted chat models, tried in order. The public catalog changes over
-// time and NVIDIA is actively retiring models (EOL entries now return HTTP 410
-// "Gone") while gating newer frontier models behind a "Public API Endpoints"
-// entitlement. Long-lived, generally-available NIM models are tried first
-// because they are the ones individual/personal keys can actually reach.
-const LLM_MODELS = [
-  'meta/llama-3.1-70b-instruct',
-  'meta/llama-3.3-70b-instruct',
-  'nvidia/llama-3.1-nemotron-70b-instruct',
-  'openai/gpt-oss-20b',
-];
+// Second NVIDIA key (LangChain example account). Both keys are tried as
+// fallback so whichever account/capacity is available can answer.
+const nvidiaChatClient2 = new OpenAI({
+  apiKey: process.env.NVIDIA_API_KEY_2,
+  baseURL: 'https://integrate.api.nvidia.com/v1',
+  timeout: 90000,
+  maxRetries: 1,
+});
+
+// NVIDIA-hosted chat attempts, tried in order. The two first entries are the
+// exact key+model pairs that are documented as working for this account:
+//   nvidiaChatClient            + meta/muse-glimmer-30b   (OpenAI-compat example)
+//   nvidiaChatClient2           + deepseek-ai/deepseek-v4-flash-0731 (LangChain example)
+// The remaining pairs are cross-combinations kept as automatic fallback.
 const LLM_ATTEMPT_TIMEOUT_MS = 30_000;
+
+type LlmAttempt = { client: OpenAI; model: string };
+
+const chatModelAttempts = (): LlmAttempt[] => [
+  { client: nvidiaChatClient, model: 'meta/muse-glimmer-30b' },
+  { client: nvidiaChatClient2, model: 'deepseek-ai/deepseek-v4-flash-0731' },
+  { client: nvidiaChatClient, model: 'deepseek-ai/deepseek-v4-flash-0731' },
+  { client: nvidiaChatClient2, model: 'meta/muse-glimmer-30b' },
+];
 
 async function completeChat(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   opts: { temperature?: number; maxTokens?: number } = {}
 ): Promise<{ content: string; model: string }> {
   const failures: string[] = [];
-  for (const model of LLM_MODELS) {
+  for (const attempt of chatModelAttempts()) {
+    const { client, model } = attempt;
     try {
-      const completion = await nvidiaChatClient.chat.completions.create({
+      const completion = await client.chat.completions.create({
         model,
         messages,
         temperature: opts.temperature ?? 0.6,
@@ -74,11 +87,11 @@ async function completeChat(
       console.warn(`LLM model ${model} failed, trying next candidate: ${err?.message || err}`);
     }
   }
-  throw new Error(failures.join(' | ') || 'All configured LLM models failed.');
+  throw new Error(failures.join(' | ') || 'All configured LLM providers failed.');
 }
 
 // ---- Per-user chat burst limiter (Tier 2, Item 6) --------------------------
-// The chat endpoint calls the SHARED NVIDIA API layer, so a single user spamming
+// The chat endpoint calls the shared NVIDIA API layer, so a single user spamming
 // messages could burn the shared key's quota for everyone. Burst control is
 // keyed on the VERIFIED Firebase uid (req.authUser!.uid), never the raw client
 // IP — one home/office/ISP NAT IP can carry dozens of real users, so IP-based
@@ -691,23 +704,38 @@ export const chatWithAI = async (req: Request, res: Response) => {
     req.on('close', () => abort.abort());
 
     if (stream) {
-      const completion = await nvidiaChatClient.chat.completions.create({
-        model: 'openai/gpt-oss-20b',
-        messages,
-        temperature: 0.6,
-        top_p: 0.95,
-        max_tokens: 700,
-        stream: true,
-        signal: abort.signal,
-      });
-
       let reply = '';
-      for await (const chunk of completion) {
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) {
-          reply += delta;
-          writeSse({ type: 'delta', text: delta });
+      let streamed = false;
+      for (const attempt of chatModelAttempts()) {
+        if (abort.signal.aborted) break;
+        try {
+          const completion = await attempt.client.chat.completions.create({
+            model: attempt.model,
+            messages,
+            temperature: 0.6,
+            top_p: 0.95,
+            max_tokens: 700,
+            stream: true,
+            signal: abort.signal,
+            timeout: LLM_ATTEMPT_TIMEOUT_MS,
+            maxRetries: 0,
+          });
+          streamed = true;
+          for await (const chunk of completion) {
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              reply += delta;
+              writeSse({ type: 'delta', text: delta });
+            }
+          }
+          break;
+        } catch (err: any) {
+          console.warn(`Chat stream model ${attempt.model} failed: ${err?.message || err}`);
         }
+      }
+      if (!streamed) {
+        writeSse({ type: 'error', message: 'All AI providers are unavailable right now. Please try again shortly.' });
+        return res.end();
       }
       if (!reply.trim()) {
         reply = 'Sorry, I could not generate a response. Please try again.';
@@ -718,18 +746,9 @@ export const chatWithAI = async (req: Request, res: Response) => {
       return;
     }
 
-    const completion = await nvidiaChatClient.chat.completions.create({
-      model: 'openai/gpt-oss-20b',
-      messages,
-      temperature: 0.6,
-      top_p: 0.95,
-      max_tokens: 700,
-      stream: false,
-    });
+    const { content: nonStreamReply } = await completeChat(messages, { temperature: 0.6, maxTokens: 700 });
 
-    const reply =
-      completion.choices[0].message.content?.trim() ||
-      'Sorry, I could not generate a response. Please try again.';
+    const reply = nonStreamReply.trim() || 'Sorry, I could not generate a response. Please try again.';
 
     aiReplyCache.set(cacheKey, { reply });
     res.json({ success: true, reply });

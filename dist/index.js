@@ -1969,18 +1969,25 @@ var nvidiaChatClient = new import_openai2.default({
   timeout: 9e4,
   maxRetries: 1
 });
-var LLM_MODELS = [
-  "meta/llama-3.1-70b-instruct",
-  "meta/llama-3.3-70b-instruct",
-  "nvidia/llama-3.1-nemotron-70b-instruct",
-  "openai/gpt-oss-20b"
-];
+var nvidiaChatClient2 = new import_openai2.default({
+  apiKey: process.env.NVIDIA_API_KEY_2,
+  baseURL: "https://integrate.api.nvidia.com/v1",
+  timeout: 9e4,
+  maxRetries: 1
+});
 var LLM_ATTEMPT_TIMEOUT_MS = 3e4;
+var chatModelAttempts = () => [
+  { client: nvidiaChatClient, model: "meta/muse-glimmer-30b" },
+  { client: nvidiaChatClient2, model: "deepseek-ai/deepseek-v4-flash-0731" },
+  { client: nvidiaChatClient, model: "deepseek-ai/deepseek-v4-flash-0731" },
+  { client: nvidiaChatClient2, model: "meta/muse-glimmer-30b" }
+];
 async function completeChat(messages, opts = {}) {
   const failures = [];
-  for (const model2 of LLM_MODELS) {
+  for (const attempt of chatModelAttempts()) {
+    const { client, model: model2 } = attempt;
     try {
-      const completion = await nvidiaChatClient.chat.completions.create({
+      const completion = await client.chat.completions.create({
         model: model2,
         messages,
         temperature: opts.temperature ?? 0.6,
@@ -1998,7 +2005,7 @@ async function completeChat(messages, opts = {}) {
       console.warn(`LLM model ${model2} failed, trying next candidate: ${err?.message || err}`);
     }
   }
-  throw new Error(failures.join(" | ") || "All configured LLM models failed.");
+  throw new Error(failures.join(" | ") || "All configured LLM providers failed.");
 }
 var CHAT_RATE_LIMIT = { CEILING: 3, WINDOW_MS: 6e4 };
 var chatBuckets = /* @__PURE__ */ new Map();
@@ -2395,22 +2402,38 @@ var chatWithAI = async (req, res) => {
     const abort = new AbortController();
     req.on("close", () => abort.abort());
     if (stream) {
-      const completion2 = await nvidiaChatClient.chat.completions.create({
-        model: "openai/gpt-oss-20b",
-        messages,
-        temperature: 0.6,
-        top_p: 0.95,
-        max_tokens: 700,
-        stream: true,
-        signal: abort.signal
-      });
       let reply2 = "";
-      for await (const chunk of completion2) {
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) {
-          reply2 += delta;
-          writeSse({ type: "delta", text: delta });
+      let streamed = false;
+      for (const attempt of chatModelAttempts()) {
+        if (abort.signal.aborted) break;
+        try {
+          const completion = await attempt.client.chat.completions.create({
+            model: attempt.model,
+            messages,
+            temperature: 0.6,
+            top_p: 0.95,
+            max_tokens: 700,
+            stream: true,
+            signal: abort.signal,
+            timeout: LLM_ATTEMPT_TIMEOUT_MS,
+            maxRetries: 0
+          });
+          streamed = true;
+          for await (const chunk of completion) {
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              reply2 += delta;
+              writeSse({ type: "delta", text: delta });
+            }
+          }
+          break;
+        } catch (err) {
+          console.warn(`Chat stream model ${attempt.model} failed: ${err?.message || err}`);
         }
+      }
+      if (!streamed) {
+        writeSse({ type: "error", message: "All AI providers are unavailable right now. Please try again shortly." });
+        return res.end();
       }
       if (!reply2.trim()) {
         reply2 = "Sorry, I could not generate a response. Please try again.";
@@ -2420,15 +2443,8 @@ var chatWithAI = async (req, res) => {
       res.end();
       return;
     }
-    const completion = await nvidiaChatClient.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages,
-      temperature: 0.6,
-      top_p: 0.95,
-      max_tokens: 700,
-      stream: false
-    });
-    const reply = completion.choices[0].message.content?.trim() || "Sorry, I could not generate a response. Please try again.";
+    const { content: nonStreamReply } = await completeChat(messages, { temperature: 0.6, maxTokens: 700 });
+    const reply = nonStreamReply.trim() || "Sorry, I could not generate a response. Please try again.";
     aiReplyCache.set(cacheKey, { reply });
     res.json({ success: true, reply });
   } catch (error) {
