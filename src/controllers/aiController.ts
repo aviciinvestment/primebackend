@@ -291,16 +291,24 @@ ${oppsContext}
 
 Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
 
-  const completion = await nvidiaChatClient.chat.completions.create({
-    model: 'openai/gpt-oss-20b',
-    messages: [{ role: 'user', content: prompt }],
-    temperature: 0.7,
-    top_p: 0.95,
-    max_tokens: 1024,
-    stream: false,
-  });
-
-  const analysis = completion.choices[0].message.content;
+  // LLM summary is best-effort: the top matches are still valid even if the
+  // chat model is briefly rate-limited or down, so degrade gracefully instead
+  // of 500-ing the whole analysis (analyze + reanalyze share this path).
+  let analysis = '';
+  try {
+    const completion = await nvidiaChatClient.chat.completions.create({
+      model: 'openai/gpt-oss-20b',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+      top_p: 0.95,
+      max_tokens: 1024,
+      stream: false,
+    });
+    analysis = completion.choices[0]?.message?.content || '';
+  } catch (llmErr: any) {
+    console.error('LLM analysis step failed during CV match:', llmErr);
+    analysis = 'Your top matching opportunities were updated. The AI summary is temporarily unavailable — try refreshing the analysis again in a moment.';
+  }
 
   const cv = new Cv({
     userId,
@@ -401,10 +409,10 @@ export const reanalyzeCV = async (req: Request, res: Response) => {
       cvText,
       userId,
       userEmail: req.authUser!.email || latestCv.userEmail || '',
-      userName: req.body.userName || latestCv.userName || '',
       fileName: latestCv.fileName,
       contentType: latestCv.contentType,
       fileData: latestCv.fileData,
+      userName: req.body?.userName || latestCv.userName || '',
     });
 
     res.json({ success: true, analysis, matches, cvId });
