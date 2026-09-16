@@ -10,17 +10,16 @@ const ADMIN_UIDS = new Set(
     .filter(Boolean)
 );
 
-// Upsert the Firebase identity into the app-user registry on login. The very
-// first user ever registered becomes an admin so there is always someone who
-// can approve mentors and manage the platform.
+// Upsert the Firebase identity into the app-user registry on login. Nobody is
+// ever auto-promoted (not even the first user): admin is granted only to UIDs
+// listed in ADMIN_UIDS, so there is no race where a random early signup owns
+// the account.
 export const syncUser = async (req: Request, res: Response) => {
   try {
     const uid = req.authUser!.uid;
     const { email, displayName, photoURL } = req.body || {};
 
-    const isFirstUser = (await AppUser.countDocuments()) === 0;
-    const role: 'user' | 'admin' =
-      isFirstUser || ADMIN_UIDS.has(String(uid)) ? 'admin' : 'user';
+    const role: 'user' | 'admin' = ADMIN_UIDS.has(String(uid)) ? 'admin' : 'user';
 
     const user = await AppUser.findOneAndUpdate(
       { uid: String(uid) },
@@ -36,8 +35,6 @@ export const syncUser = async (req: Request, res: Response) => {
         upsert: true,
         new: true,
         setDefaultsOnInsert: true,
-        // Existing docs keep whatever role they had unless they match ADMIN_UIDS.
-        ...(ADMIN_UIDS.has(String(uid)) ? {} : {}),
       }
     );
 

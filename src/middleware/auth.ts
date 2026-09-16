@@ -41,6 +41,21 @@ const verifyToken = async (req: Request): Promise<AuthUser> => {
 export const requireAuth = async (req: Request, res: Response, next: NextFunction) => {
   try {
     req.authUser = await verifyToken(req);
+
+    // M6: block unverified accounts server-side (defense in depth — the UI
+    // also gates on emailVerified). Admins keep access even if their email is
+    // not verified so the promote/bootstrap flow never deadlocks.
+    if (!req.authUser.emailVerified) {
+      const user = await AppUser.findOne({ uid: req.authUser.uid }).select('role').lean();
+      if (!user || user.role !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          code: 'EMAIL_NOT_VERIFIED',
+          error: 'Please verify your email before continuing.',
+        });
+      }
+    }
+
     return next();
   } catch (error: any) {
     return res

@@ -87,7 +87,12 @@ export const upsertApplication = async (req: Request, res: Response) => {
     }
 
     if (Object.keys(updates).length > 0) {
-      Object.assign(existing, updates);
+      // Assign only the whitelisted fields explicitly (never Object.assign a
+      // body-shaped object onto the document).
+      if (updates.status) existing.status = updates.status;
+      if (updates.dateApplied) existing.dateApplied = updates.dateApplied;
+      if (updates.clicked === true) existing.clicked = true;
+      if (updates.clickedAt) existing.clickedAt = updates.clickedAt;
       await existing.save();
     }
 

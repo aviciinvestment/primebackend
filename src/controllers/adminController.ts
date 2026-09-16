@@ -30,7 +30,7 @@ export const getOverview = async (_req: Request, res: Response) => {
       totalMentors,
       pendingMentorApplications,
       totalMentees,
-      paidMenteeCount: paidRequests.length,
+      paidMenteeCount,
       grossRevenue,
       platformRevenue: grossRevenue * PLATFORM_CUT,
       mentorPayout: grossRevenue * (1 - PLATFORM_CUT),

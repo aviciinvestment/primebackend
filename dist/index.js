@@ -2070,6 +2070,16 @@ var verifyToken = async (req) => {
 var requireAuth = async (req, res, next) => {
   try {
     req.authUser = await verifyToken(req);
+    if (!req.authUser.emailVerified) {
+      const user = await AppUser_default.findOne({ uid: req.authUser.uid }).select("role").lean();
+      if (!user || user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          code: "EMAIL_NOT_VERIFIED",
+          error: "Please verify your email before continuing."
+        });
+      }
+    }
     return next();
   } catch (error) {
     return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
@@ -2360,7 +2370,10 @@ var upsertApplication = async (req, res) => {
       updates.clickedAt = /* @__PURE__ */ new Date();
     }
     if (Object.keys(updates).length > 0) {
-      Object.assign(existing, updates);
+      if (updates.status) existing.status = updates.status;
+      if (updates.dateApplied) existing.dateApplied = updates.dateApplied;
+      if (updates.clicked === true) existing.clicked = true;
+      if (updates.clickedAt) existing.clickedAt = updates.clickedAt;
       await existing.save();
     }
     const populated = await existing.populate("opportunityId");
@@ -2499,8 +2512,7 @@ var syncUser = async (req, res) => {
   try {
     const uid = req.authUser.uid;
     const { email, displayName, photoURL } = req.body || {};
-    const isFirstUser = await AppUser_default.countDocuments() === 0;
-    const role = isFirstUser || ADMIN_UIDS.has(String(uid)) ? "admin" : "user";
+    const role = ADMIN_UIDS.has(String(uid)) ? "admin" : "user";
     const user = await AppUser_default.findOneAndUpdate(
       { uid: String(uid) },
       {
@@ -2514,9 +2526,7 @@ var syncUser = async (req, res) => {
       {
         upsert: true,
         new: true,
-        setDefaultsOnInsert: true,
-        // Existing docs keep whatever role they had unless they match ADMIN_UIDS.
-        ...ADMIN_UIDS.has(String(uid)) ? {} : {}
+        setDefaultsOnInsert: true
       }
     );
     if (ADMIN_UIDS.has(String(uid)) && user.role !== "admin") {
@@ -2617,7 +2627,7 @@ var getOverview = async (_req, res) => {
       totalMentors,
       pendingMentorApplications,
       totalMentees,
-      paidMenteeCount: paidRequests.length,
+      paidMenteeCount,
       grossRevenue,
       platformRevenue: grossRevenue * PLATFORM_CUT,
       mentorPayout: grossRevenue * (1 - PLATFORM_CUT)
