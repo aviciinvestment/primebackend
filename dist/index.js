@@ -1969,6 +1969,36 @@ var nvidiaChatClient = new import_openai2.default({
   timeout: 9e4,
   maxRetries: 1
 });
+var LLM_MODELS = [
+  "openai/gpt-oss-20b",
+  "nvidia/llama-3.1-nemotron-70b-instruct",
+  "meta/llama-3.3-70b-instruct"
+];
+var LLM_ATTEMPT_TIMEOUT_MS = 45e3;
+async function completeChat(messages, opts = {}) {
+  let lastErr = null;
+  for (const model2 of LLM_MODELS) {
+    try {
+      const completion = await nvidiaChatClient.chat.completions.create({
+        model: model2,
+        messages,
+        temperature: opts.temperature ?? 0.6,
+        top_p: 0.95,
+        max_tokens: opts.maxTokens ?? 700,
+        stream: false,
+        timeout: LLM_ATTEMPT_TIMEOUT_MS,
+        maxRetries: 0
+      });
+      const content = completion.choices[0]?.message?.content || "";
+      if (content.trim()) return { content, model: model2 };
+      lastErr = new Error("model returned an empty completion");
+    } catch (err) {
+      lastErr = err;
+      console.warn(`LLM model ${model2} failed, trying next candidate: ${err?.message || err}`);
+    }
+  }
+  throw lastErr || new Error("All configured LLM models failed.");
+}
 var CHAT_RATE_LIMIT = { CEILING: 3, WINDOW_MS: 6e4 };
 var chatBuckets = /* @__PURE__ */ new Map();
 var chatRateLimitCheck = (uid) => {
@@ -2127,18 +2157,14 @@ ${oppsContext}
 Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
   let analysis = "";
   try {
-    const completion = await nvidiaChatClient.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      top_p: 0.95,
-      max_tokens: 1024,
-      stream: false
-    });
-    analysis = completion.choices[0]?.message?.content || "";
+    const result = await completeChat(
+      [{ role: "user", content: prompt }],
+      { temperature: 0.7, maxTokens: 1024 }
+    );
+    analysis = result.content;
   } catch (llmErr) {
-    console.error("LLM analysis step failed during CV match:", llmErr);
-    analysis = "Your top matching opportunities were updated. The AI summary is temporarily unavailable \u2014 try refreshing the analysis again in a moment.";
+    console.error("All LLM models failed during CV match:", llmErr);
+    analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable \u2014 try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || "unknown"})`;
   }
   const cv = new Cv_default({
     userId,

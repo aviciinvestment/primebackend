@@ -36,6 +36,46 @@ const nvidiaChatClient = new OpenAI({
   maxRetries: 1,
 });
 
+// NVIDIA-hosted chat models, tried in order. The public catalog changes over
+// time (models get retired/renamed), so the primary model can 404/400 even
+// though embed + Pinecone still work. Each attempt gets a short budget —
+// otherwise a slow/cold model stalls the whole refresh for minutes. We never
+// retry the same model; we just move to the next candidate.
+const LLM_MODELS = [
+  'openai/gpt-oss-20b',
+  'nvidia/llama-3.1-nemotron-70b-instruct',
+  'meta/llama-3.3-70b-instruct',
+];
+const LLM_ATTEMPT_TIMEOUT_MS = 45_000;
+
+async function completeChat(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  opts: { temperature?: number; maxTokens?: number } = {}
+): Promise<{ content: string; model: string }> {
+  let lastErr: unknown = null;
+  for (const model of LLM_MODELS) {
+    try {
+      const completion = await nvidiaChatClient.chat.completions.create({
+        model,
+        messages,
+        temperature: opts.temperature ?? 0.6,
+        top_p: 0.95,
+        max_tokens: opts.maxTokens ?? 700,
+        stream: false,
+        timeout: LLM_ATTEMPT_TIMEOUT_MS,
+        maxRetries: 0,
+      });
+      const content = completion.choices[0]?.message?.content || '';
+      if (content.trim()) return { content, model };
+      lastErr = new Error('model returned an empty completion');
+    } catch (err: any) {
+      lastErr = err;
+      console.warn(`LLM model ${model} failed, trying next candidate: ${err?.message || err}`);
+    }
+  }
+  throw lastErr || new Error('All configured LLM models failed.');
+}
+
 // ---- Per-user chat burst limiter (Tier 2, Item 6) --------------------------
 // The chat endpoint calls the SHARED NVIDIA API layer, so a single user spamming
 // messages could burn the shared key's quota for everyone. Burst control is
@@ -291,23 +331,20 @@ ${oppsContext}
 
 Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
 
-  // LLM summary is best-effort: the top matches are still valid even if the
-  // chat model is briefly rate-limited or down, so degrade gracefully instead
-  // of 500-ing the whole analysis (analyze + reanalyze share this path).
+  // LLM summary is best-effort: the top matches are still valid even if every
+  // configured chat model is briefly down/rate-limited, so degrade gracefully
+  // instead of 500-ing the whole analysis. The last failure reason is included
+  // in the note so the real cause is visible in the UI (and pastable to logs).
   let analysis = '';
   try {
-    const completion = await nvidiaChatClient.chat.completions.create({
-      model: 'openai/gpt-oss-20b',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      top_p: 0.95,
-      max_tokens: 1024,
-      stream: false,
-    });
-    analysis = completion.choices[0]?.message?.content || '';
+    const result = await completeChat(
+      [{ role: 'user', content: prompt }],
+      { temperature: 0.7, maxTokens: 1024 }
+    );
+    analysis = result.content;
   } catch (llmErr: any) {
-    console.error('LLM analysis step failed during CV match:', llmErr);
-    analysis = 'Your top matching opportunities were updated. The AI summary is temporarily unavailable — try refreshing the analysis again in a moment.';
+    console.error('All LLM models failed during CV match:', llmErr);
+    analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable — try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || 'unknown'})`;
   }
 
   const cv = new Cv({
