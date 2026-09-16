@@ -403,6 +403,82 @@ export const getOpportunities = async (req: Request, res: Response) => {
 
 export const getAllOpportunities = getOpportunities;
 
+// ---------------------------------------------------------------------------
+// Admin: manually create an opportunity from a form (not a PDF sync).
+// ---------------------------------------------------------------------------
+
+const splitList = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.map(String).map(s => s.trim()).filter(Boolean);
+  if (typeof value === 'string') return value.split(',').map(s => s.trim()).filter(Boolean);
+  return [];
+};
+
+export const createManualOpportunity = async (req: Request, res: Response) => {
+  try {
+    const b = req.body || {};
+    const title = typeof b.title === 'string' ? b.title.trim() : '';
+    const organization = typeof b.organization === 'string' ? b.organization.trim() : '';
+    const description = typeof b.description === 'string' ? b.description.trim() : '';
+    const officialUrl = sanitizeOfficialUrl(b.officialUrl);
+
+    if (!title || !organization || !description || !officialUrl) {
+      res.status(400).json({
+        success: false,
+        error: 'title, organization, description, and a valid https:// officialUrl are required.',
+      });
+      return;
+    }
+
+    // Dedupe by normalized URL — avoids collisions with the sync pipeline.
+    const existing = await Opportunity.findOne({ officialUrl }).lean().select('_id title');
+    if (existing) {
+      res.status(409).json({
+        success: false,
+        error: `An opportunity with this URL already exists: ${existing.title} (${existing._id})`,
+      });
+      return;
+    }
+
+    const validStatuses = ['OPEN', 'CLOSING SOON', 'CLOSED', 'UPCOMING', 'DEADLINE UNKNOWN'];
+    const status = typeof b.status === 'string' && validStatuses.includes(b.status) ? b.status : 'OPEN';
+
+    const rawPriority = Number(b.priorityScore);
+    const priorityScore = Number.isFinite(rawPriority)
+      ? Math.max(0, Math.min(1000, Math.round(rawPriority)))
+      : 80;
+
+    const doc = await Opportunity.create({
+      title,
+      organization,
+      description,
+      officialUrl,
+      status,
+      category: typeof b.category === 'string' ? b.category.trim() : undefined,
+      opportunityType: typeof b.opportunityType === 'string' ? b.opportunityType.trim() : undefined,
+      location: typeof b.location === 'string' ? b.location.trim() : undefined,
+      deadline: typeof b.deadline === 'string' && b.deadline ? b.deadline.trim() : undefined,
+      fundingAmount: typeof b.fundingAmount === 'string' ? b.fundingAmount.trim() : undefined,
+      currency: typeof b.currency === 'string' ? b.currency.trim() : undefined,
+      eligibleEducationLevels: splitList(b.eligibleEducationLevels),
+      eligibleFields: splitList(b.eligibleFields),
+      tags: splitList(b.tags),
+      verificationStatus: 'Verified',
+      sourceName: 'Admin (manual)',
+      isAiDiscovered: false,
+      vectorized: false,
+      priorityScore,
+      dateDiscovered: new Date(),
+    });
+
+    invalidateOpportunityFeedCache();
+
+    res.status(201).json({ success: true, data: doc });
+  } catch (error: any) {
+    console.error('Error creating manual opportunity:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
 // @desc    Get single opportunity
 // @route   GET /api/opportunities/:id
 // @access  Public

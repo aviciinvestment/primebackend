@@ -5,9 +5,9 @@ import Opportunity from '../models/Opportunity';
 // and hands humans off to this origin via meta-refresh + canonical link.
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://prime-ed.vercel.app').replace(/\/+$/, '');
 
-// Brand asset served by the static host — stable fallback for og:image when an
-// opportunity has no organization logo.
-const BRAND_OG_IMAGE = `${FRONTEND_URL}/student_cutout_v2.webp`;
+// Brand asset served by the static host — the app logo (not a hero photo) is
+// the og:image for every shared capsule.
+const BRAND_OG_IMAGE = `${FRONTEND_URL}/prime-logo.png`;
 
 const escapeHtml = (value: unknown): string =>
   String(value ?? '')
@@ -172,7 +172,6 @@ export const getSharePreview = async (
   let opp: {
     title?: string;
     organization?: string;
-    organizationLogo?: string;
     description?: string;
     eligibleEducationLevels?: string[];
     eligibleFields?: string[];
@@ -184,7 +183,7 @@ export const getSharePreview = async (
   try {
     opp = await Opportunity.findById(id)
       .select(
-        'title organization organizationLogo description eligibleEducationLevels eligibleFields deadline fundingAmount currency status'
+        'title organization description eligibleEducationLevels eligibleFields deadline fundingAmount currency status'
       )
       .lean();
   } catch {
@@ -205,10 +204,7 @@ export const getSharePreview = async (
   const appLink = `${FRONTEND_URL}/opportunities?id=${id}`;
   const ogTitle = truncate(`${opp.title || 'Opportunity'}${opp.organization ? ` · ${opp.organization}` : ''}`, 70);
   const ogDescription = buildDescription(opp);
-  const ogImage =
-    opp.organizationLogo && /^https?:\/\//i.test(opp.organizationLogo)
-      ? opp.organizationLogo
-      : BRAND_OG_IMAGE;
+  const ogImage = BRAND_OG_IMAGE;
 
   res
     .status(200)

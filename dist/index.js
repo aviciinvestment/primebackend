@@ -304,6 +304,20 @@ var buildSeekFilter = (cursor, keys) => {
   }
   return { $or: or };
 };
+var UNSAFE_URL_SCHEMES = ["javascript:", "data:", "file:", "vbscript:", "blob:"];
+var sanitizeOfficialUrl = (value) => {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  if (UNSAFE_URL_SCHEMES.some((scheme) => lower.startsWith(scheme))) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  } catch {
+    return "";
+  }
+  return raw;
+};
 var tokenize = (text) => new Set(
   text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t.length > 1)
 );
@@ -441,6 +455,66 @@ var getOpportunities = async (req, res) => {
       message: "Server Error",
       error: error.message
     });
+  }
+};
+var splitList = (value) => {
+  if (Array.isArray(value)) return value.map(String).map((s) => s.trim()).filter(Boolean);
+  if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+};
+var createManualOpportunity = async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = typeof b.title === "string" ? b.title.trim() : "";
+    const organization = typeof b.organization === "string" ? b.organization.trim() : "";
+    const description = typeof b.description === "string" ? b.description.trim() : "";
+    const officialUrl = sanitizeOfficialUrl(b.officialUrl);
+    if (!title || !organization || !description || !officialUrl) {
+      res.status(400).json({
+        success: false,
+        error: "title, organization, description, and a valid https:// officialUrl are required."
+      });
+      return;
+    }
+    const existing = await Opportunity_default.findOne({ officialUrl }).lean().select("_id title");
+    if (existing) {
+      res.status(409).json({
+        success: false,
+        error: `An opportunity with this URL already exists: ${existing.title} (${existing._id})`
+      });
+      return;
+    }
+    const validStatuses = ["OPEN", "CLOSING SOON", "CLOSED", "UPCOMING", "DEADLINE UNKNOWN"];
+    const status = typeof b.status === "string" && validStatuses.includes(b.status) ? b.status : "OPEN";
+    const rawPriority = Number(b.priorityScore);
+    const priorityScore = Number.isFinite(rawPriority) ? Math.max(0, Math.min(1e3, Math.round(rawPriority))) : 80;
+    const doc = await Opportunity_default.create({
+      title,
+      organization,
+      description,
+      officialUrl,
+      status,
+      category: typeof b.category === "string" ? b.category.trim() : void 0,
+      opportunityType: typeof b.opportunityType === "string" ? b.opportunityType.trim() : void 0,
+      location: typeof b.location === "string" ? b.location.trim() : void 0,
+      deadline: typeof b.deadline === "string" && b.deadline ? b.deadline.trim() : void 0,
+      fundingAmount: typeof b.fundingAmount === "string" ? b.fundingAmount.trim() : void 0,
+      currency: typeof b.currency === "string" ? b.currency.trim() : void 0,
+      eligibleEducationLevels: splitList(b.eligibleEducationLevels),
+      eligibleFields: splitList(b.eligibleFields),
+      tags: splitList(b.tags),
+      verificationStatus: "Verified",
+      sourceName: "Admin (manual)",
+      isAiDiscovered: false,
+      vectorized: false,
+      priorityScore,
+      dateDiscovered: /* @__PURE__ */ new Date()
+    });
+    invalidateOpportunityFeedCache();
+    res.status(201).json({ success: true, data: doc });
+  } catch (error) {
+    console.error("Error creating manual opportunity:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 };
 var getOpportunity = async (req, res) => {
@@ -1435,7 +1509,7 @@ var import_express3 = __toESM(require("express"));
 
 // src/controllers/socialPreviewController.ts
 var FRONTEND_URL = (process.env.FRONTEND_URL || "https://prime-ed.vercel.app").replace(/\/+$/, "");
-var BRAND_OG_IMAGE = `${FRONTEND_URL}/student_cutout_v2.webp`;
+var BRAND_OG_IMAGE = `${FRONTEND_URL}/prime-logo.png`;
 var escapeHtml = (value) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 var truncate = (text, max) => {
   const trimmed = (text || "").trim().replace(/\s+/g, " ");
@@ -1543,7 +1617,7 @@ var getSharePreview = async (req, res) => {
   let opp = null;
   try {
     opp = await Opportunity_default.findById(id).select(
-      "title organization organizationLogo description eligibleEducationLevels eligibleFields deadline fundingAmount currency status"
+      "title organization description eligibleEducationLevels eligibleFields deadline fundingAmount currency status"
     ).lean();
   } catch {
     opp = null;
@@ -1555,8 +1629,93 @@ var getSharePreview = async (req, res) => {
   const appLink = `${FRONTEND_URL}/opportunities?id=${id}`;
   const ogTitle = truncate(`${opp.title || "Opportunity"}${opp.organization ? ` \xB7 ${opp.organization}` : ""}`, 70);
   const ogDescription = buildDescription(opp);
-  const ogImage = opp.organizationLogo && /^https?:\/\//i.test(opp.organizationLogo) ? opp.organizationLogo : BRAND_OG_IMAGE;
+  const ogImage = BRAND_OG_IMAGE;
   res.status(200).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildShareHtml({ appLink, ogTitle, ogDescription, ogImage, status: opp.status }));
+};
+
+// src/lib/firebaseAdmin.ts
+var import_app = require("firebase-admin/app");
+var import_auth = require("firebase-admin/auth");
+var FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "primeopportunity-18381";
+var app = null;
+var initFirebaseAdmin = () => {
+  if (!app) {
+    app = (0, import_app.getApps)()[0] || (0, import_app.initializeApp)({ projectId: FIREBASE_PROJECT_ID });
+  }
+  return app;
+};
+var getAdminAuth = () => {
+  initFirebaseAdmin();
+  return (0, import_auth.getAuth)();
+};
+
+// src/models/AppUser.ts
+var import_mongoose6 = __toESM(require("mongoose"));
+var AppUserSchema = new import_mongoose6.Schema(
+  {
+    uid: { type: String, required: true, unique: true, index: true },
+    email: { type: String, trim: true, lowercase: true },
+    displayName: { type: String, trim: true },
+    photoURL: { type: String },
+    role: { type: String, enum: ["user", "admin"], default: "user" },
+    mentorshipInterest: {
+      choice: { type: String, enum: ["yes", "no", null], default: null },
+      source: { type: String, enum: ["opportunity", "general"], default: "general" },
+      opportunityTitle: { type: String, default: "" },
+      opportunityUrl: { type: String, default: "" },
+      answeredAt: { type: Date }
+    }
+  },
+  { timestamps: true }
+);
+var AppUser_default = import_mongoose6.default.model("AppUser", AppUserSchema);
+
+// src/middleware/auth.ts
+var BEARER_RE = /^Bearer\s+(.+)$/i;
+var verifyToken = async (req) => {
+  const header = req.headers.authorization || "";
+  const match = BEARER_RE.exec(header);
+  if (!match?.[1]) {
+    const err = new Error("Authentication required.");
+    err.status = 401;
+    throw err;
+  }
+  const decoded = await getAdminAuth().verifyIdToken(match[1].trim());
+  return {
+    uid: decoded.uid,
+    email: decoded.email || null,
+    emailVerified: !!decoded.email_verified
+  };
+};
+var requireAuth = async (req, res, next) => {
+  try {
+    req.authUser = await verifyToken(req);
+    if (!req.authUser.emailVerified) {
+      const user = await AppUser_default.findOne({ uid: req.authUser.uid }).select("role").lean();
+      if (!user || user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          code: "EMAIL_NOT_VERIFIED",
+          error: "Please verify your email before continuing."
+        });
+      }
+    }
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
+  }
+};
+var requireAdmin = async (req, res, next) => {
+  try {
+    req.authUser = await verifyToken(req);
+    const user = await AppUser_default.findOne({ uid: req.authUser.uid }).lean();
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, error: "Admin access only." });
+    }
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
+  }
 };
 
 // src/routes/opportunityRoutes.ts
@@ -1565,6 +1724,7 @@ router.get("/", getOpportunities);
 router.get("/share", getSharePreview);
 router.get("/:id", getOpportunity);
 router.get("/:id/share", getSharePreview);
+router.post("/", requireAdmin, createManualOpportunity);
 var opportunityRoutes_default = router;
 
 // src/routes/aiRoutes.ts
@@ -1574,14 +1734,14 @@ var import_multer = __toESM(require("multer"));
 // src/controllers/aiController.ts
 var import_express4 = require("express");
 var import_crypto = require("crypto");
-var import_mongoose9 = require("mongoose");
+var import_mongoose10 = require("mongoose");
 var import_pdf_parse = require("pdf-parse");
 var import_pinecone2 = require("@pinecone-database/pinecone");
 var import_openai2 = __toESM(require("openai"));
 
 // src/models/Cv.ts
-var import_mongoose6 = __toESM(require("mongoose"));
-var CvSchema = new import_mongoose6.Schema(
+var import_mongoose7 = __toESM(require("mongoose"));
+var CvSchema = new import_mongoose7.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String },
@@ -1591,16 +1751,16 @@ var CvSchema = new import_mongoose6.Schema(
     fileData: { type: Buffer, required: true },
     text: { type: String },
     analysis: { type: String },
-    matchIds: [{ type: import_mongoose6.Schema.Types.ObjectId, ref: "Opportunity" }]
+    matchIds: [{ type: import_mongoose7.Schema.Types.ObjectId, ref: "Opportunity" }]
   },
   { timestamps: true }
 );
 CvSchema.index({ userId: 1, createdAt: -1 });
-var Cv_default = import_mongoose6.default.model("Cv", CvSchema);
+var Cv_default = import_mongoose7.default.model("Cv", CvSchema);
 
 // src/models/Mentorship.ts
-var import_mongoose7 = __toESM(require("mongoose"));
-var MentorshipSchema = new import_mongoose7.Schema(
+var import_mongoose8 = __toESM(require("mongoose"));
+var MentorshipSchema = new import_mongoose8.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String, trim: true, lowercase: true },
@@ -1625,11 +1785,11 @@ var MentorshipSchema = new import_mongoose7.Schema(
 MentorshipSchema.index({ status: 1 });
 MentorshipSchema.index({ status: 1, mentorId: 1 });
 MentorshipSchema.index({ mentorId: 1, status: 1 });
-var Mentorship_default = import_mongoose7.default.model("Mentorship", MentorshipSchema);
+var Mentorship_default = import_mongoose8.default.model("Mentorship", MentorshipSchema);
 
 // src/models/MentorshipComplaint.ts
-var import_mongoose8 = __toESM(require("mongoose"));
-var MentorshipComplaintSchema = new import_mongoose8.Schema(
+var import_mongoose9 = __toESM(require("mongoose"));
+var MentorshipComplaintSchema = new import_mongoose9.Schema(
   {
     ticket: { type: String, required: true, unique: true },
     userId: { type: String, required: true, index: true },
@@ -1653,7 +1813,7 @@ var MentorshipComplaintSchema = new import_mongoose8.Schema(
   { timestamps: true }
 );
 MentorshipComplaintSchema.index({ status: 1, createdAt: -1 });
-var MentorshipComplaint_default = import_mongoose8.default.model("MentorshipComplaint", MentorshipComplaintSchema);
+var MentorshipComplaint_default = import_mongoose9.default.model("MentorshipComplaint", MentorshipComplaintSchema);
 
 // src/lib/cache.ts
 var LRUCache = class {
@@ -1934,6 +2094,69 @@ var seedUserCvVectors = async (cvText, userId, cvId, fileName) => {
   await index.namespace(namespace).upsert(vectors);
   return { namespace, chunks: vectors.length };
 };
+async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData }) {
+  const truncatedCVText = cvText.substring(0, 4e3);
+  const cvVector = await embedText(truncatedCVText);
+  const index = pinecone2.index(INDEX_NAME2);
+  const queryResponse = await index.query({
+    vector: cvVector,
+    topK: 5,
+    includeMetadata: true
+  });
+  const matchIds = queryResponse.matches.map((match) => match.id);
+  const matchedOpportunities = await Opportunity_default.find({ _id: { $in: matchIds } });
+  const sortedOpportunities = matchIds.map((id) => matchedOpportunities.find((o) => o._id.toString() === id)).filter(Boolean);
+  const oppsContext = sortedOpportunities.map(
+    (opp, index2) => `[${index2 + 1}] ${opp?.title} at ${opp?.organization}
+Category: ${opp?.category}
+Type: ${opp?.opportunityType}
+Location: ${opp?.location}
+Description: ${opp?.description}
+`
+  ).join("\n");
+  const prompt = `You are an expert career advisor.
+A user has uploaded their CV, and our semantic search engine has found the top matching opportunities from our database.
+Analyze the user's CV and explain why these specific opportunities are a great match for them. Highlight their strengths and suggest the best one to apply for.
+
+USER CV:
+${truncatedCVText}
+
+TOP MATCHING OPPORTUNITIES:
+${oppsContext}
+
+Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
+  const completion = await nvidiaChatClient.chat.completions.create({
+    model: "openai/gpt-oss-20b",
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.7,
+    top_p: 0.95,
+    max_tokens: 1024,
+    stream: false
+  });
+  const analysis = completion.choices[0].message.content;
+  const cv = new Cv_default({
+    userId,
+    userEmail,
+    userName,
+    fileName,
+    contentType,
+    fileData,
+    text: cvText,
+    analysis,
+    matchIds: sortedOpportunities.map((o) => o._id)
+  });
+  await cv.save();
+  try {
+    const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
+    await withNamespaceLock(
+      cvNamespace,
+      () => seedUserCvVectors(cvText, userId, cv._id.toString(), fileName)
+    );
+  } catch (vecErr) {
+    console.error("Could not seed CV vectors to Pinecone:", vecErr);
+  }
+  return { analysis, matches: sortedOpportunities, cvId: cv._id.toString() };
+}
 var analyzeCV = async (req, res) => {
   try {
     if (!req.file) {
@@ -1953,82 +2176,54 @@ var analyzeCV = async (req, res) => {
       res.status(400).json({ success: false, message: "Could not extract text from the provided PDF." });
       return;
     }
-    const truncatedCVText = cvText.substring(0, 4e3);
-    const cvVector = await embedText(truncatedCVText);
-    const index = pinecone2.index(INDEX_NAME2);
-    const queryResponse = await index.query({
-      vector: cvVector,
-      topK: 5,
-      includeMetadata: true
-    });
-    const matchIds = queryResponse.matches.map((match) => match.id);
-    const matchedOpportunities = await Opportunity_default.find({ _id: { $in: matchIds } });
-    const sortedOpportunities = matchIds.map((id) => matchedOpportunities.find((o) => o._id.toString() === id)).filter(Boolean);
-    const oppsContext = sortedOpportunities.map(
-      (opp, index2) => `[${index2 + 1}] ${opp?.title} at ${opp?.organization}
-Category: ${opp?.category}
-Type: ${opp?.opportunityType}
-Location: ${opp?.location}
-Description: ${opp?.description}
-`
-    ).join("\n");
-    const prompt = `You are an expert career advisor.
-A user has uploaded their CV, and our semantic search engine has found the top matching opportunities from our database.
-Analyze the user's CV and explain why these specific opportunities are a great match for them. Highlight their strengths and suggest the best one to apply for.
-
-USER CV:
-${truncatedCVText}
-
-TOP MATCHING OPPORTUNITIES:
-${oppsContext}
-
-Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
-    const completion = await nvidiaChatClient.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      top_p: 0.95,
-      max_tokens: 1024,
-      stream: false
-    });
-    const analysis = completion.choices[0].message.content;
     const userId = req.authUser.uid;
-    let savedCv = null;
-    if (userId) {
-      const cv = new Cv_default({
-        userId,
-        userEmail: req.authUser.email || "",
-        userName: req.body.userName || "",
-        fileName: req.file.originalname,
-        contentType: req.file.mimetype,
-        fileData: req.file.buffer,
-        text: cvText,
-        analysis,
-        matchIds: sortedOpportunities.map((o) => o._id)
-      });
-      await cv.save();
-      savedCv = cv;
-      try {
-        const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
-        await withNamespaceLock(
-          cvNamespace,
-          () => seedUserCvVectors(cvText, userId, savedCv._id.toString(), req.file.originalname)
-        );
-      } catch (vecErr) {
-        console.error("Could not seed CV vectors to Pinecone:", vecErr);
-      }
-    }
-    res.json({
-      success: true,
-      analysis,
-      matches: sortedOpportunities,
-      cvId: savedCv?._id || null
+    const { analysis, matches, cvId } = await runCvMatch({
+      cvText,
+      userId,
+      userEmail: req.authUser.email || "",
+      userName: req.body.userName || "",
+      fileName: req.file.originalname,
+      contentType: req.file.mimetype,
+      fileData: req.file.buffer
     });
+    res.json({ success: true, analysis, matches, cvId });
   } catch (error) {
     console.error("Error analyzing CV:", error);
     res.status(500).json({
       success: false,
       message: "Failed to analyze CV.",
+      error: error.message
+    });
+  }
+};
+var reanalyzeCV = async (req, res) => {
+  try {
+    const userId = req.authUser.uid;
+    const latestCv = await Cv_default.findOne({ userId }).sort({ createdAt: -1 });
+    if (!latestCv) {
+      res.status(400).json({ success: false, message: "No saved CV found. Upload a CV first." });
+      return;
+    }
+    const cvText = (latestCv.text || "").trim();
+    if (!cvText) {
+      res.status(400).json({ success: false, message: "Saved CV has no extractable text. Upload a fresh PDF." });
+      return;
+    }
+    const { analysis, matches, cvId } = await runCvMatch({
+      cvText,
+      userId,
+      userEmail: req.authUser.email || latestCv.userEmail || "",
+      userName: req.body.userName || latestCv.userName || "",
+      fileName: latestCv.fileName,
+      contentType: latestCv.contentType,
+      fileData: latestCv.fileData
+    });
+    res.json({ success: true, analysis, matches, cvId });
+  } catch (error) {
+    console.error("Error re-analyzing CV:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to re-analyze CV.",
       error: error.message
     });
   }
@@ -2362,7 +2557,7 @@ var downloadCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose9.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose10.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -2384,7 +2579,7 @@ var deleteCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose9.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose10.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -2408,7 +2603,7 @@ var deleteCV = async (req, res) => {
 var getRetrievedOpportunityContext = async (req, res) => {
   try {
     const rawIds = req.body?.ids;
-    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose9.isValidObjectId)(id)).slice(0, 8) : [];
+    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose10.isValidObjectId)(id)).slice(0, 8) : [];
     if (ids.length === 0) {
       return res.json({ success: true, context: null });
     }
@@ -2443,91 +2638,6 @@ var recordMentorshipComplaint = async (req, res) => {
   }
 };
 
-// src/lib/firebaseAdmin.ts
-var import_app = require("firebase-admin/app");
-var import_auth = require("firebase-admin/auth");
-var FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "primeopportunity-18381";
-var app = null;
-var initFirebaseAdmin = () => {
-  if (!app) {
-    app = (0, import_app.getApps)()[0] || (0, import_app.initializeApp)({ projectId: FIREBASE_PROJECT_ID });
-  }
-  return app;
-};
-var getAdminAuth = () => {
-  initFirebaseAdmin();
-  return (0, import_auth.getAuth)();
-};
-
-// src/models/AppUser.ts
-var import_mongoose10 = __toESM(require("mongoose"));
-var AppUserSchema = new import_mongoose10.Schema(
-  {
-    uid: { type: String, required: true, unique: true, index: true },
-    email: { type: String, trim: true, lowercase: true },
-    displayName: { type: String, trim: true },
-    photoURL: { type: String },
-    role: { type: String, enum: ["user", "admin"], default: "user" },
-    mentorshipInterest: {
-      choice: { type: String, enum: ["yes", "no", null], default: null },
-      source: { type: String, enum: ["opportunity", "general"], default: "general" },
-      opportunityTitle: { type: String, default: "" },
-      opportunityUrl: { type: String, default: "" },
-      answeredAt: { type: Date }
-    }
-  },
-  { timestamps: true }
-);
-var AppUser_default = import_mongoose10.default.model("AppUser", AppUserSchema);
-
-// src/middleware/auth.ts
-var BEARER_RE = /^Bearer\s+(.+)$/i;
-var verifyToken = async (req) => {
-  const header = req.headers.authorization || "";
-  const match = BEARER_RE.exec(header);
-  if (!match?.[1]) {
-    const err = new Error("Authentication required.");
-    err.status = 401;
-    throw err;
-  }
-  const decoded = await getAdminAuth().verifyIdToken(match[1].trim());
-  return {
-    uid: decoded.uid,
-    email: decoded.email || null,
-    emailVerified: !!decoded.email_verified
-  };
-};
-var requireAuth = async (req, res, next) => {
-  try {
-    req.authUser = await verifyToken(req);
-    if (!req.authUser.emailVerified) {
-      const user = await AppUser_default.findOne({ uid: req.authUser.uid }).select("role").lean();
-      if (!user || user.role !== "admin") {
-        return res.status(403).json({
-          success: false,
-          code: "EMAIL_NOT_VERIFIED",
-          error: "Please verify your email before continuing."
-        });
-      }
-    }
-    return next();
-  } catch (error) {
-    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
-  }
-};
-var requireAdmin = async (req, res, next) => {
-  try {
-    req.authUser = await verifyToken(req);
-    const user = await AppUser_default.findOne({ uid: req.authUser.uid }).lean();
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, error: "Admin access only." });
-    }
-    return next();
-  } catch (error) {
-    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
-  }
-};
-
 // src/routes/aiRoutes.ts
 var router2 = import_express5.default.Router();
 var storage = import_multer.default.memoryStorage();
@@ -2550,6 +2660,7 @@ var upload = (0, import_multer.default)({
   }
 });
 router2.post("/analyze-cv", cvAnalyzeLimiter, requireAuth, upload.single("cv"), analyzeCV);
+router2.post("/reanalyze-cv", cvAnalyzeLimiter, requireAuth, reanalyzeCV);
 router2.get("/my-cvs", requireAuth, getMyCVs);
 router2.get("/cv/:cvId/download", requireAuth, downloadCV);
 router2.delete("/cv/:cvId", requireAuth, deleteCV);

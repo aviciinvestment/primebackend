@@ -241,62 +241,45 @@ const seedUserCvVectors = async (
   return { namespace, chunks: vectors.length };
 };
 
-export const analyzeCV = async (req: Request, res: Response) => {
-  try {
-if (!req.file) {
-      res.status(400).json({ success: false, message: 'No CV file uploaded.' });
-      return;
-    }
+// ---------------------------------------------------------------------------
+// Shared CV-match pipeline: embed → Pinecone query → LLM analysis → persist
+// Used by both the initial analyzeCV (PDF upload) and the new reanalyzeCV
+// (stored-text re-analysis) so the two paths stay identical.
+// ---------------------------------------------------------------------------
 
-    // The multer check only trusts the declared Content-Type; verify the file
-    // is actually a PDF by its magic bytes (%PDF-) so a renamed payload is
-    // rejected before pdf-parse ever sees it.
-    const PDF_MAGIC = Buffer.from('%PDF-', 'utf8');
-    if (!req.file.buffer.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC)) {
-      res.status(400).json({ success: false, message: 'Only PDF files are allowed.' });
-      return;
-    }
+interface RunCvMatchArgs {
+  cvText: string;
+  userId: string;
+  userEmail: string;
+  userName: string;
+  fileName: string;
+  contentType: string;
+  fileData: Buffer;
+}
 
-    // 1. Extract Text from PDF
-    const parser = new PDFParse({ data: req.file.buffer });
-    const pdfData = await parser.getText();
-    await parser.destroy();
-    const cvText = pdfData.text.trim();
+async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData }: RunCvMatchArgs) {
+  const truncatedCVText = cvText.substring(0, 4000);
 
-    if (!cvText) {
-      res.status(400).json({ success: false, message: 'Could not extract text from the provided PDF.' });
-      return;
-    }
-    
-    // We limit the text to the first 4000 characters to avoid huge embedding token limits
-    const truncatedCVText = cvText.substring(0, 4000);
+  const cvVector = await embedText(truncatedCVText);
 
-// 2. Generate Embedding for the CV (cache-backed).
-    const cvVector = await embedText(truncatedCVText);
+  const index = pinecone.index(INDEX_NAME);
+  const queryResponse = await index.query({
+    vector: cvVector,
+    topK: 5,
+    includeMetadata: true,
+  });
 
-    // 3. Query Pinecone for Top Matches
-    const index = pinecone.index(INDEX_NAME);
-    const queryResponse = await index.query({
-      vector: cvVector,
-      topK: 5,
-      includeMetadata: true,
-    });
+  const matchIds = queryResponse.matches.map(match => match.id);
+  const matchedOpportunities = await Opportunity.find({ _id: { $in: matchIds } });
+  const sortedOpportunities = matchIds
+    .map(id => matchedOpportunities.find(o => o._id.toString() === id))
+    .filter(Boolean);
 
-    const matchIds = queryResponse.matches.map(match => match.id);
-    
-    // Fetch full data for these opportunities
-    const matchedOpportunities = await Opportunity.find({ _id: { $in: matchIds } });
-    
-    // Sort them exactly as Pinecone returned them
-    const sortedOpportunities = matchIds.map(id => matchedOpportunities.find(o => o._id.toString() === id)).filter(Boolean);
+  const oppsContext = sortedOpportunities.map((opp, index) =>
+    `[${index + 1}] ${opp?.title} at ${opp?.organization}\nCategory: ${opp?.category}\nType: ${opp?.opportunityType}\nLocation: ${opp?.location}\nDescription: ${opp?.description}\n`
+  ).join('\n');
 
-    // 4. Generate AI Analysis using DeepSeek
-    // Create a prompt that includes the CV and the matched opportunities
-    const oppsContext = sortedOpportunities.map((opp, index) => 
-      `[${index + 1}] ${opp?.title} at ${opp?.organization}\nCategory: ${opp?.category}\nType: ${opp?.opportunityType}\nLocation: ${opp?.location}\nDescription: ${opp?.description}\n`
-    ).join('\n');
-
-    const prompt = `You are an expert career advisor.
+  const prompt = `You are an expert career advisor.
 A user has uploaded their CV, and our semantic search engine has found the top matching opportunities from our database.
 Analyze the user's CV and explain why these specific opportunities are a great match for them. Highlight their strengths and suggest the best one to apply for.
 
@@ -308,62 +291,128 @@ ${oppsContext}
 
 Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
 
-    const completion = await nvidiaChatClient.chat.completions.create({
-      model: 'openai/gpt-oss-20b',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      top_p: 0.95,
-      max_tokens: 1024,
-      stream: false,
-    });
+  const completion = await nvidiaChatClient.chat.completions.create({
+    model: 'openai/gpt-oss-20b',
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.7,
+    top_p: 0.95,
+    max_tokens: 1024,
+    stream: false,
+  });
 
-    const analysis = completion.choices[0].message.content;
+  const analysis = completion.choices[0].message.content;
 
-// 5. Persist CV + matches to MongoDB (assigned to the authenticated user)
-    const userId = req.authUser!.uid;
-    let savedCv: any = null;
-    if (userId) {
-const cv = new Cv({
-        userId,
-        userEmail: req.authUser!.email || '',
-        userName: req.body.userName || '',
-        fileName: req.file.originalname,
-        contentType: req.file.mimetype,
-        fileData: req.file.buffer,
-        text: cvText,
-        analysis,
-        matchIds: sortedOpportunities.map(o => o!._id),
-      });
-      await cv.save();
-      savedCv = cv;
+  const cv = new Cv({
+    userId,
+    userEmail,
+    userName,
+    fileName,
+    contentType,
+    fileData,
+    text: cvText,
+    analysis,
+    matchIds: sortedOpportunities.map(o => o!._id),
+  });
+  await cv.save();
 
-// 5b. Vectorize the CV into the user's private Pinecone namespace so the
-      // chat assistant has personalized context. Failure here must NOT block
-      // the CV analysis result. Runs under the per-namespace lock so an upload
-      // that races a chat self-heal on the same user's namespace serializes
-      // instead of interleaving delete/upsert writes.
-      try {
-        const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
-        await withNamespaceLock(cvNamespace, () =>
-          seedUserCvVectors(cvText, userId, savedCv._id.toString(), req.file.originalname)
-        );
-      } catch (vecErr) {
-        console.error('Could not seed CV vectors to Pinecone:', vecErr);
-      }
+  // Seed CV vectors into the user's private Pinecone namespace so the chat
+  // assistant has personalized context. Failure must NOT block the result.
+  try {
+    const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
+    await withNamespaceLock(cvNamespace, () =>
+      seedUserCvVectors(cvText, userId, cv._id.toString(), fileName)
+    );
+  } catch (vecErr) {
+    console.error('Could not seed CV vectors to Pinecone:', vecErr);
+  }
+
+  return { analysis, matches: sortedOpportunities, cvId: cv._id.toString() };
+}
+
+// ---- CV Analysis (PDF upload) --------------------------------------------
+
+export const analyzeCV = async (req: Request, res: Response) => {
+  try {
+    if (!req.file) {
+      res.status(400).json({ success: false, message: 'No CV file uploaded.' });
+      return;
     }
 
-    // 6. Return Results
-    res.json({
-      success: true,
-      analysis,
-      matches: sortedOpportunities,
-      cvId: savedCv?._id || null,
+    const PDF_MAGIC = Buffer.from('%PDF-', 'utf8');
+    if (!req.file.buffer.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC)) {
+      res.status(400).json({ success: false, message: 'Only PDF files are allowed.' });
+      return;
+    }
+
+    const parser = new PDFParse({ data: req.file.buffer });
+    const pdfData = await parser.getText();
+    await parser.destroy();
+    const cvText = pdfData.text.trim();
+
+    if (!cvText) {
+      res.status(400).json({ success: false, message: 'Could not extract text from the provided PDF.' });
+      return;
+    }
+
+    const userId = req.authUser!.uid;
+    const { analysis, matches, cvId } = await runCvMatch({
+      cvText,
+      userId,
+      userEmail: req.authUser!.email || '',
+      userName: req.body.userName || '',
+      fileName: req.file.originalname,
+      contentType: req.file.mimetype,
+      fileData: req.file.buffer,
     });
+
+    res.json({ success: true, analysis, matches, cvId });
   } catch (error: any) {
     console.error('Error analyzing CV:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to analyze CV.',
+      error: error.message,
+    });
+  }
+};
+
+// ---- CV Re-analysis (reload against latest opportunities) -----------------
+// Uses the stored CV text + metadata from the user's most recent upload so no
+// file transfer is needed. Produces a fresh analysis against the current
+// Pinecone index (which contains newly synced opportunities).
+
+export const reanalyzeCV = async (req: Request, res: Response) => {
+  try {
+    const userId = req.authUser!.uid;
+
+    const latestCv = await Cv.findOne({ userId }).sort({ createdAt: -1 });
+    if (!latestCv) {
+      res.status(400).json({ success: false, message: 'No saved CV found. Upload a CV first.' });
+      return;
+    }
+
+    const cvText = (latestCv.text || '').trim();
+    if (!cvText) {
+      res.status(400).json({ success: false, message: 'Saved CV has no extractable text. Upload a fresh PDF.' });
+      return;
+    }
+
+    const { analysis, matches, cvId } = await runCvMatch({
+      cvText,
+      userId,
+      userEmail: req.authUser!.email || latestCv.userEmail || '',
+      userName: req.body.userName || latestCv.userName || '',
+      fileName: latestCv.fileName,
+      contentType: latestCv.contentType,
+      fileData: latestCv.fileData,
+    });
+
+    res.json({ success: true, analysis, matches, cvId });
+  } catch (error: any) {
+    console.error('Error re-analyzing CV:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to re-analyze CV.',
       error: error.message,
     });
   }
