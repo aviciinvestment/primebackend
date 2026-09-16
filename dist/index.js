@@ -103,6 +103,10 @@ OpportunitySchema.index({ eligibleFields: 1 });
 OpportunitySchema.index({ eligibleCountries: 1 });
 OpportunitySchema.index({ officialUrl: 1 });
 OpportunitySchema.index({ status: 1, priorityScore: -1, dateDiscovered: -1 });
+OpportunitySchema.index({ status: 1, dateDiscovered: -1 });
+OpportunitySchema.index({ status: 1, deadline: 1, dateDiscovered: -1 });
+OpportunitySchema.index({ category: 1 });
+OpportunitySchema.index({ opportunityType: 1 });
 OpportunitySchema.index({
   title: "text",
   organization: "text",
@@ -206,8 +210,8 @@ var embedOpportunitiesBatched = async (opps, batchSize = 10) => {
 
 // src/controllers/opportunityController.ts
 var MIN_SEARCH_SCORE = parseFloat(process.env.SEMANTIC_MIN_SCORE || "0.15");
-var FEED_CACHE_TTL_MS = 60 * 1e3;
-var FEED_CACHE_MAX_ENTRIES = 60;
+var FEED_CACHE_TTL_MS = 120 * 1e3;
+var FEED_CACHE_MAX_ENTRIES = 250;
 var feedCache = /* @__PURE__ */ new Map();
 var feedCacheKey = (req) => {
   const parts = [];
@@ -270,7 +274,7 @@ var getOpportunities = async (req, res) => {
     const skip = (page - 1) * limit;
     const filter = {};
     if (!req.query.status) {
-      filter.status = { $ne: "CLOSED" };
+      filter.status = { $in: ["OPEN", "CLOSING SOON", "UPCOMING", "DEADLINE UNKNOWN"] };
     } else {
       filter.status = req.query.status;
     }
@@ -1272,7 +1276,7 @@ var errorJson = (req, res) => {
 };
 var sharedStore = new MongoStore();
 var windowMs = 60 * 1e3;
-var baseOptions = (name, limit) => ({
+var makeOptions = (name, limit, opts = {}) => ({
   windowMs,
   limit,
   standardHeaders: true,
@@ -1280,15 +1284,17 @@ var baseOptions = (name, limit) => ({
   legacyHeaders: false,
   // Disable the `X-RateLimit-*` headers
   handler: errorJson,
-  store: sharedStore,
   // req.ip is set by 'trust proxy' from the proxy chain; prefix it so each
   // limiter owns a disjoint key space in the shared Mongo collection.
-  keyGenerator: (req) => `${name}:${req.ip || req.socket.remoteAddress || "unknown"}`
+  keyGenerator: (req) => `${name}:${req.ip || req.socket.remoteAddress || "unknown"}`,
+  ...opts
 });
-var apiLimiter = (0, import_express_rate_limit.default)(baseOptions("api", 120));
-var strictLimiter = (0, import_express_rate_limit.default)(baseOptions("strict", 20));
-var sensitiveLimiter = (0, import_express_rate_limit.default)(baseOptions("sensitive", 5));
-var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(baseOptions("cv", 5));
+var apiLimiter = (0, import_express_rate_limit.default)(
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("api", 120, { store: sharedStore }) : makeOptions("api", 120)
+);
+var strictLimiter = (0, import_express_rate_limit.default)(makeOptions("strict", 20, { store: sharedStore }));
+var sensitiveLimiter = (0, import_express_rate_limit.default)(makeOptions("sensitive", 5, { store: sharedStore }));
+var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(makeOptions("cv", 5, { store: sharedStore }));
 
 // src/lib/withLock.ts
 var import_mongoose5 = __toESM(require("mongoose"));

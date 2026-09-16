@@ -9,13 +9,13 @@ const MIN_SEARCH_SCORE = parseFloat(process.env.SEMANTIC_MIN_SCORE || '0.15');
 // ---------------------------------------------------------------------------
 // Public feed cache (P-01). The /api/opportunities listing is public,
 // read-heavy, and (outside of syncs) only changes when deadlines expire. Serve
-// repeat requests straight from memory for up to 60s to cut Mongo + (for
+// repeat requests straight from memory for up to 120s to cut Mongo + (for
 // searches) Pinecone round-trips, and clear the whole cache after each sync so
 // freshly inserted/closed listings surface immediately. The key is the
 // normalized query string; the cache is size-bounded and self-evicting.
 // ---------------------------------------------------------------------------
-const FEED_CACHE_TTL_MS = 60 * 1000;
-const FEED_CACHE_MAX_ENTRIES = 60;
+const FEED_CACHE_TTL_MS = 120 * 1000;
+const FEED_CACHE_MAX_ENTRIES = 250;
 
 interface FeedCacheEntry {
   at: number;
@@ -143,9 +143,11 @@ export const getOpportunities = async (req: Request, res: Response) => {
     const filter: any = {};
 
     // Expired/closed listings leave the dashboard by default. Pass ?status= to
-    // override (e.g. ?status=CLOSED to inspect history).
+    // override (e.g. ?status=CLOSED to inspect history). Using $in over $ne lets
+    // Mongo seek the status prefix of the feed compound index instead of
+    // scanning for the inequality.
     if (!req.query.status) {
-      filter.status = { $ne: 'CLOSED' };
+      filter.status = { $in: ['OPEN', 'CLOSING SOON', 'UPCOMING', 'DEADLINE UNKNOWN'] };
     } else {
       filter.status = req.query.status;
     }

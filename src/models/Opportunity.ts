@@ -141,6 +141,11 @@ OpportunitySchema.index({ eligibleCountries: 1 });
 // Feeds sort by status then priority/discovery date; dedupe/search by URL.
 OpportunitySchema.index({ officialUrl: 1 });
 OpportunitySchema.index({ status: 1, priorityScore: -1, dateDiscovered: -1 });
+// Feed sort variants + filter fields hit by ?sort=newest|deadline&category=&type=
+OpportunitySchema.index({ status: 1, dateDiscovered: -1 });
+OpportunitySchema.index({ status: 1, deadline: 1, dateDiscovered: -1 });
+OpportunitySchema.index({ category: 1 });
+OpportunitySchema.index({ opportunityType: 1 });
 
 // Full-text search index
 OpportunitySchema.index({
