@@ -37,22 +37,23 @@ const nvidiaChatClient = new OpenAI({
 });
 
 // NVIDIA-hosted chat models, tried in order. The public catalog changes over
-// time (models get retired/renamed), so the primary model can 404/400 even
-// though embed + Pinecone still work. Each attempt gets a short budget —
-// otherwise a slow/cold model stalls the whole refresh for minutes. We never
-// retry the same model; we just move to the next candidate.
+// time and NVIDIA is actively retiring models (EOL entries now return HTTP 410
+// "Gone") while gating newer frontier models behind a "Public API Endpoints"
+// entitlement. Long-lived, generally-available NIM models are tried first
+// because they are the ones individual/personal keys can actually reach.
 const LLM_MODELS = [
-  'openai/gpt-oss-20b',
-  'nvidia/llama-3.1-nemotron-70b-instruct',
+  'meta/llama-3.1-70b-instruct',
   'meta/llama-3.3-70b-instruct',
+  'nvidia/llama-3.1-nemotron-70b-instruct',
+  'openai/gpt-oss-20b',
 ];
-const LLM_ATTEMPT_TIMEOUT_MS = 45_000;
+const LLM_ATTEMPT_TIMEOUT_MS = 30_000;
 
 async function completeChat(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   opts: { temperature?: number; maxTokens?: number } = {}
 ): Promise<{ content: string; model: string }> {
-  let lastErr: unknown = null;
+  const failures: string[] = [];
   for (const model of LLM_MODELS) {
     try {
       const completion = await nvidiaChatClient.chat.completions.create({
@@ -67,13 +68,13 @@ async function completeChat(
       });
       const content = completion.choices[0]?.message?.content || '';
       if (content.trim()) return { content, model };
-      lastErr = new Error('model returned an empty completion');
+      failures.push(`${model} -> empty completion`);
     } catch (err: any) {
-      lastErr = err;
+      failures.push(`${model} -> ${err?.message || err}`);
       console.warn(`LLM model ${model} failed, trying next candidate: ${err?.message || err}`);
     }
   }
-  throw lastErr || new Error('All configured LLM models failed.');
+  throw new Error(failures.join(' | ') || 'All configured LLM models failed.');
 }
 
 // ---- Per-user chat burst limiter (Tier 2, Item 6) --------------------------

@@ -1970,13 +1970,14 @@ var nvidiaChatClient = new import_openai2.default({
   maxRetries: 1
 });
 var LLM_MODELS = [
-  "openai/gpt-oss-20b",
+  "meta/llama-3.1-70b-instruct",
+  "meta/llama-3.3-70b-instruct",
   "nvidia/llama-3.1-nemotron-70b-instruct",
-  "meta/llama-3.3-70b-instruct"
+  "openai/gpt-oss-20b"
 ];
-var LLM_ATTEMPT_TIMEOUT_MS = 45e3;
+var LLM_ATTEMPT_TIMEOUT_MS = 3e4;
 async function completeChat(messages, opts = {}) {
-  let lastErr = null;
+  const failures = [];
   for (const model2 of LLM_MODELS) {
     try {
       const completion = await nvidiaChatClient.chat.completions.create({
@@ -1991,13 +1992,13 @@ async function completeChat(messages, opts = {}) {
       });
       const content = completion.choices[0]?.message?.content || "";
       if (content.trim()) return { content, model: model2 };
-      lastErr = new Error("model returned an empty completion");
+      failures.push(`${model2} -> empty completion`);
     } catch (err) {
-      lastErr = err;
+      failures.push(`${model2} -> ${err?.message || err}`);
       console.warn(`LLM model ${model2} failed, trying next candidate: ${err?.message || err}`);
     }
   }
-  throw lastErr || new Error("All configured LLM models failed.");
+  throw new Error(failures.join(" | ") || "All configured LLM models failed.");
 }
 var CHAT_RATE_LIMIT = { CEILING: 3, WINDOW_MS: 6e4 };
 var chatBuckets = /* @__PURE__ */ new Map();
