@@ -6,6 +6,87 @@ import { semanticSearchOpportunities } from '../services/opportunityVectorServic
 // real match (index metric is cosine, so 0..1). Configurable via env.
 const MIN_SEARCH_SCORE = parseFloat(process.env.SEMANTIC_MIN_SCORE || '0.15');
 
+// ---------------------------------------------------------------------------
+// Public feed cache (P-01). The /api/opportunities listing is public,
+// read-heavy, and (outside of syncs) only changes when deadlines expire. Serve
+// repeat requests straight from memory for up to 60s to cut Mongo + (for
+// searches) Pinecone round-trips, and clear the whole cache after each sync so
+// freshly inserted/closed listings surface immediately. The key is the
+// normalized query string; the cache is size-bounded and self-evicting.
+// ---------------------------------------------------------------------------
+const FEED_CACHE_TTL_MS = 60 * 1000;
+const FEED_CACHE_MAX_ENTRIES = 60;
+
+interface FeedCacheEntry {
+  at: number;
+  payload: unknown;
+}
+
+const feedCache = new Map<string, FeedCacheEntry>();
+
+const feedCacheKey = (req: Request): string => {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(req.query)) {
+    const v = Array.isArray(value) ? value.join(',') : value == null ? '' : String(value);
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`);
+  }
+  return parts.sort().join('&');
+};
+
+const feedCacheGet = (key: string): unknown | null => {
+  const entry = feedCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > FEED_CACHE_TTL_MS) {
+    feedCache.delete(key);
+    return null;
+  }
+  return entry.payload;
+};
+
+const feedCacheSet = (key: string, payload: unknown): void => {
+  if (feedCache.size >= FEED_CACHE_MAX_ENTRIES) {
+    // Map preserves insertion order, so the first key is the oldest.
+    const oldestKey = feedCache.keys().next().value;
+    if (oldestKey !== undefined) feedCache.delete(oldestKey);
+  }
+  feedCache.set(key, { at: Date.now(), payload });
+};
+
+// Called by the opportunity sync after it commits new/updated/closed listings
+// so the public feed reflects the change right away (not after the 60s TTL).
+export const invalidateOpportunityFeedCache = (): void => {
+  feedCache.clear();
+};
+
+// ---------------------------------------------------------------------------
+// URL safety (S12). Any URL that reaches the dashboard is rendered as a link
+// users click, so stored listings must never carry an executable scheme
+// (javascript:, data:, file:, vbscript:). Defense-in-depth: reject at the
+// input boundary AND at the storage boundary (see syncOpportunities.safeUrl).
+// ---------------------------------------------------------------------------
+
+// URL schemes that can execute content when followed as a link — stored-XSS.
+const UNSAFE_URL_SCHEMES: ReadonlyArray<string> = ['javascript:', 'data:', 'file:', 'vbscript:', 'blob:'];
+
+// Strict validation: returns the trimmed URL when it is a plain http(s) link
+// with none of the executable schemes, and '' (falsy) otherwise. Fail closed.
+export const sanitizeOfficialUrl = (value: unknown): string => {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+
+  const lower = raw.toLowerCase();
+  if (UNSAFE_URL_SCHEMES.some(scheme => lower.startsWith(scheme))) return '';
+
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+  } catch {
+    return '';
+  }
+
+  return raw;
+};
+
 // Split text into meaningful lowercase tokens (drop 1-char/stop noise).
 const tokenize = (text: string): Set<string> =>
   new Set(
@@ -40,9 +121,22 @@ const sharesToken = (doc: any, queryTokens: Set<string>): boolean => {
 // @route   GET /api/opportunities
 // @access  Public
 export const getOpportunities = async (req: Request, res: Response) => {
+  const cacheKey = feedCacheKey(req);
+  const cached = feedCacheGet(cacheKey);
+  if (cached !== null) {
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    return res.json(cached);
+  }
+
   try {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
+    // Clamp pagination so a public endpoint can't be forced into massive
+    // Mongo skips or megabyte-sized JSON responses via ?page=&limit=.
+    const MAX_PAGE = 1000;
+    const MAX_LIMIT = 50;
+    const rawPage = parseInt(req.query.page as string);
+    const rawLimit = parseInt(req.query.limit as string);
+    const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.min(rawPage, MAX_PAGE) : 1;
+    const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, MAX_LIMIT) : 10;
     const skip = (page - 1) * limit;
 
     // Build filter query based on query params
@@ -102,7 +196,7 @@ export const getOpportunities = async (req: Request, res: Response) => {
         const total = relevant.length;
         const pageStart = (page - 1) * limit;
 
-        res.json({
+        const payload = {
           success: true,
           count: Math.min(limit, total - pageStart),
           total,
@@ -110,7 +204,10 @@ export const getOpportunities = async (req: Request, res: Response) => {
           pages: Math.ceil(total / limit),
           data: relevant.slice(pageStart, pageStart + limit),
           semantic: true,
-        });
+        };
+        feedCacheSet(cacheKey, payload);
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        res.json(payload);
         return;
       } catch (error: any) {
         console.error('Semantic search failed, falling back to text search:', error?.message || error);
@@ -136,7 +233,7 @@ export const getOpportunities = async (req: Request, res: Response) => {
 
     const total = await Opportunity.countDocuments(filter);
 
-    res.json({
+    const payload = {
       success: true,
       count: opportunities.length,
       total,
@@ -144,7 +241,10 @@ export const getOpportunities = async (req: Request, res: Response) => {
       pages: Math.ceil(total / limit),
       data: opportunities,
       semantic: false,
-    });
+    };
+    feedCacheSet(cacheKey, payload);
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.json(payload);
   } catch (error: any) {
     console.error('Error fetching opportunities:', error);
     res.status(500).json({

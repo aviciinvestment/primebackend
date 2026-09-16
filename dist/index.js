@@ -25,8 +25,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // src/index.ts
 var import_config = require("dotenv/config");
 var import_express18 = __toESM(require("express"));
+var import_compression = __toESM(require("compression"));
 var import_cors = __toESM(require("cors"));
-var import_mongoose13 = __toESM(require("mongoose"));
+var import_mongoose14 = __toESM(require("mongoose"));
 var import_node_cron = __toESM(require("node-cron"));
 var import_helmet = __toESM(require("helmet"));
 var import_multer2 = __toESM(require("multer"));
@@ -109,6 +110,255 @@ OpportunitySchema.index({
   tags: "text"
 });
 var Opportunity_default = import_mongoose.default.model("Opportunity", OpportunitySchema);
+
+// src/controllers/opportunityController.ts
+var import_express = require("express");
+
+// src/services/opportunityVectorService.ts
+var import_pinecone = require("@pinecone-database/pinecone");
+var import_openai = __toESM(require("openai"));
+var pinecone = new import_pinecone.Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+var INDEX_NAME = "prime-opportunity-index";
+var embedClient = new import_openai.default({
+  apiKey: process.env.NVIDIA_EMBED_API_KEY,
+  baseURL: "https://integrate.api.nvidia.com/v1"
+});
+var EMBED_MODEL = "nvidia/nemotron-3-embed-1b";
+var buildOpportunityVectorText = (opp) => {
+  return `
+    Title: ${opp.title}
+    Organization: ${opp.organization}
+    Category: ${opp.category}
+    Type: ${opp.opportunityType}
+    Location: ${opp.location}
+    Description: ${opp.description}
+    Tags: ${(opp.tags || []).join(", ")}
+  `.trim();
+};
+var generateEmbedding = async (text) => {
+  const response = await embedClient.embeddings.create({
+    model: EMBED_MODEL,
+    input: text
+  });
+  return response.data[0].embedding;
+};
+var upsertOpportunityVector = async (opp) => {
+  const index = pinecone.index(INDEX_NAME);
+  const embedding = await generateEmbedding(buildOpportunityVectorText(opp));
+  await index.upsert([
+    {
+      id: opp._id.toString(),
+      values: embedding,
+      metadata: {
+        title: opp.title,
+        organization: opp.organization,
+        category: opp.category || "",
+        opportunityType: opp.opportunityType || "",
+        location: opp.location || "",
+        deadline: opp.deadline || "",
+        status: opp.status || "",
+        officialUrl: opp.officialUrl || ""
+      }
+    }
+  ]);
+  await Opportunity_default.updateOne({ _id: opp._id }, { $set: { vectorized: true } });
+};
+var semanticSearchOpportunities = async (query, topK = 100) => {
+  const index = pinecone.index(INDEX_NAME);
+  const embedding = await generateEmbedding(query);
+  const queryResponse = await index.query({
+    vector: embedding,
+    topK,
+    includeMetadata: false
+  });
+  return (queryResponse.matches || []).map((match) => ({
+    id: match.id,
+    score: match.score ?? 0
+  }));
+};
+var deleteOpportunityVector = async (oppId) => {
+  try {
+    await pinecone.index(INDEX_NAME).deleteOne(oppId);
+  } catch (err) {
+    if (err?.name && err.name !== "PineconeNotFoundError") {
+      throw err;
+    }
+  }
+};
+var embedOpportunitiesBatched = async (opps, batchSize = 10) => {
+  let embedded = 0;
+  let failed = 0;
+  for (let i = 0; i < opps.length; i += batchSize) {
+    const batch = opps.slice(i, i + batchSize);
+    const results = await Promise.allSettled(
+      batch.map((opp) => upsertOpportunityVector(opp))
+    );
+    results.forEach((r) => {
+      if (r.status === "fulfilled") embedded += 1;
+      else {
+        failed += 1;
+        console.error("Vector embedding failed:", r.reason?.message);
+      }
+    });
+  }
+  return { embedded, failed };
+};
+
+// src/controllers/opportunityController.ts
+var MIN_SEARCH_SCORE = parseFloat(process.env.SEMANTIC_MIN_SCORE || "0.15");
+var FEED_CACHE_TTL_MS = 60 * 1e3;
+var FEED_CACHE_MAX_ENTRIES = 60;
+var feedCache = /* @__PURE__ */ new Map();
+var feedCacheKey = (req) => {
+  const parts = [];
+  for (const [key, value] of Object.entries(req.query)) {
+    const v = Array.isArray(value) ? value.join(",") : value == null ? "" : String(value);
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`);
+  }
+  return parts.sort().join("&");
+};
+var feedCacheGet = (key) => {
+  const entry = feedCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > FEED_CACHE_TTL_MS) {
+    feedCache.delete(key);
+    return null;
+  }
+  return entry.payload;
+};
+var feedCacheSet = (key, payload) => {
+  if (feedCache.size >= FEED_CACHE_MAX_ENTRIES) {
+    const oldestKey = feedCache.keys().next().value;
+    if (oldestKey !== void 0) feedCache.delete(oldestKey);
+  }
+  feedCache.set(key, { at: Date.now(), payload });
+};
+var invalidateOpportunityFeedCache = () => {
+  feedCache.clear();
+};
+var tokenize = (text) => new Set(
+  text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t.length > 1)
+);
+var sharesToken = (doc, queryTokens) => {
+  const haystack = [
+    doc?.title,
+    doc?.organization,
+    doc?.category,
+    doc?.opportunityType,
+    doc?.location,
+    (doc?.tags || []).join(" ")
+  ].filter(Boolean).join(" ").toLowerCase();
+  for (const token of queryTokens) {
+    if (haystack.includes(token)) return true;
+  }
+  return false;
+};
+var getOpportunities = async (req, res) => {
+  const cacheKey = feedCacheKey(req);
+  const cached = feedCacheGet(cacheKey);
+  if (cached !== null) {
+    res.setHeader("Cache-Control", "public, max-age=60");
+    return res.json(cached);
+  }
+  try {
+    const MAX_PAGE = 1e3;
+    const MAX_LIMIT = 50;
+    const rawPage = parseInt(req.query.page);
+    const rawLimit = parseInt(req.query.limit);
+    const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.min(rawPage, MAX_PAGE) : 1;
+    const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, MAX_LIMIT) : 10;
+    const skip = (page - 1) * limit;
+    const filter = {};
+    if (!req.query.status) {
+      filter.status = { $ne: "CLOSED" };
+    } else {
+      filter.status = req.query.status;
+    }
+    if (req.query.category) {
+      filter.category = req.query.category;
+    }
+    if (req.query.type) {
+      const types = req.query.type.split(",");
+      filter.opportunityType = { $in: types };
+    }
+    const searchText = (req.query.search || "").trim();
+    if (searchText) {
+      try {
+        const topK = Math.min(page * limit, 500);
+        const matches = (await semanticSearchOpportunities(searchText, topK)).filter((m) => m.score >= MIN_SEARCH_SCORE).slice(0, topK);
+        if (matches.length === 0) {
+          res.json({ success: true, count: 0, total: 0, page, pages: 0, data: [], semantic: true });
+          return;
+        }
+        const ids = matches.map((m) => m.id);
+        const scoreBy = new Map(matches.map((m) => [m.id, m.score]));
+        const docs = await Opportunity_default.find({ ...filter, _id: { $in: ids } });
+        const ordered = docs.map((doc) => ({ doc, score: scoreBy.get(doc._id.toString()) || 0 })).sort((a, b) => b.score - a.score).map((o) => o.doc);
+        const queryTokens = tokenize(searchText);
+        const relevant = queryTokens.size > 0 ? ordered.filter((doc) => sharesToken(doc, queryTokens)) : ordered;
+        const total2 = relevant.length;
+        const pageStart = (page - 1) * limit;
+        const payload2 = {
+          success: true,
+          count: Math.min(limit, total2 - pageStart),
+          total: total2,
+          page,
+          pages: Math.ceil(total2 / limit),
+          data: relevant.slice(pageStart, pageStart + limit),
+          semantic: true
+        };
+        feedCacheSet(cacheKey, payload2);
+        res.setHeader("Cache-Control", "public, max-age=60");
+        res.json(payload2);
+        return;
+      } catch (error) {
+        console.error("Semantic search failed, falling back to text search:", error?.message || error);
+        filter.$text = { $search: searchText };
+      }
+    }
+    let sortQuery = { priorityScore: -1, dateDiscovered: -1 };
+    if (filter.$text) {
+      sortQuery = { score: { $meta: "textScore" } };
+    } else if (req.query.sort === "newest") {
+      sortQuery = { dateDiscovered: -1 };
+    } else if (req.query.sort === "deadline") {
+      sortQuery = { deadline: 1, dateDiscovered: -1 };
+    }
+    const opportunities = await Opportunity_default.find(filter).sort(sortQuery).skip(skip).limit(limit);
+    const total = await Opportunity_default.countDocuments(filter);
+    const payload = {
+      success: true,
+      count: opportunities.length,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      data: opportunities,
+      semantic: false
+    };
+    feedCacheSet(cacheKey, payload);
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.json(payload);
+  } catch (error) {
+    console.error("Error fetching opportunities:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server Error",
+      error: error.message
+    });
+  }
+};
+var getOpportunity = async (req, res) => {
+  try {
+    const opportunity = await Opportunity_default.findById(req.params.id);
+    if (!opportunity) {
+      res.status(404).json({ success: false, error: "Opportunity not found" });
+      return;
+    }
+    res.status(200).json({ success: true, data: opportunity });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "Server Error" });
+  }
+};
 
 // src/services/sources.ts
 var import_axios = __toESM(require("axios"));
@@ -620,98 +870,19 @@ var getSourceAdapters = () => {
   return adapters;
 };
 
-// src/services/opportunityVectorService.ts
-var import_pinecone = require("@pinecone-database/pinecone");
-var import_openai = __toESM(require("openai"));
-var pinecone = new import_pinecone.Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-var INDEX_NAME = "prime-opportunity-index";
-var embedClient = new import_openai.default({
-  apiKey: process.env.NVIDIA_EMBED_API_KEY,
-  baseURL: "https://integrate.api.nvidia.com/v1"
-});
-var EMBED_MODEL = "nvidia/nemotron-3-embed-1b";
-var buildOpportunityVectorText = (opp) => {
-  return `
-    Title: ${opp.title}
-    Organization: ${opp.organization}
-    Category: ${opp.category}
-    Type: ${opp.opportunityType}
-    Location: ${opp.location}
-    Description: ${opp.description}
-    Tags: ${(opp.tags || []).join(", ")}
-  `.trim();
-};
-var generateEmbedding = async (text) => {
-  const response = await embedClient.embeddings.create({
-    model: EMBED_MODEL,
-    input: text
-  });
-  return response.data[0].embedding;
-};
-var upsertOpportunityVector = async (opp) => {
-  const index = pinecone.index(INDEX_NAME);
-  const embedding = await generateEmbedding(buildOpportunityVectorText(opp));
-  await index.upsert([
-    {
-      id: opp._id.toString(),
-      values: embedding,
-      metadata: {
-        title: opp.title,
-        organization: opp.organization,
-        category: opp.category || "",
-        opportunityType: opp.opportunityType || "",
-        location: opp.location || "",
-        deadline: opp.deadline || "",
-        status: opp.status || "",
-        officialUrl: opp.officialUrl || ""
-      }
-    }
-  ]);
-  await Opportunity_default.updateOne({ _id: opp._id }, { $set: { vectorized: true } });
-};
-var semanticSearchOpportunities = async (query, topK = 100) => {
-  const index = pinecone.index(INDEX_NAME);
-  const embedding = await generateEmbedding(query);
-  const queryResponse = await index.query({
-    vector: embedding,
-    topK,
-    includeMetadata: false
-  });
-  return (queryResponse.matches || []).map((match) => ({
-    id: match.id,
-    score: match.score ?? 0
-  }));
-};
-var deleteOpportunityVector = async (oppId) => {
-  try {
-    await pinecone.index(INDEX_NAME).deleteOne(oppId);
-  } catch (err) {
-    if (err?.name && err.name !== "PineconeNotFoundError") {
-      throw err;
-    }
-  }
-};
-var embedOpportunitiesBatched = async (opps, batchSize = 10) => {
-  let embedded = 0;
-  let failed = 0;
-  for (let i = 0; i < opps.length; i += batchSize) {
-    const batch = opps.slice(i, i + batchSize);
-    const results = await Promise.allSettled(
-      batch.map((opp) => upsertOpportunityVector(opp))
-    );
-    results.forEach((r) => {
-      if (r.status === "fulfilled") embedded += 1;
-      else {
-        failed += 1;
-        console.error("Vector embedding failed:", r.reason?.message);
-      }
-    });
-  }
-  return { embedded, failed };
-};
-
 // src/services/syncOpportunities.ts
 var escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var unsafeScheme = /^(?:java|vb|js)?script:|^data:|^file:|^blob:|\s/i;
+var safeUrl = (url) => {
+  const raw = String(url || "").trim();
+  if (!raw || unsafeScheme.test(raw)) return "";
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? raw : "";
+  } catch {
+    return "";
+  }
+};
 var cleanDescription = (text) => text.replace(/<[^>]*>/g, " ").replace(/&amp;/g, "&").replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;|&apos;/g, "'").replace(/\s+/g, " ").trim();
 var cleanText = (text) => String(text || "").replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "").trim();
 var findExisting = async (s) => {
@@ -761,6 +932,8 @@ var runOpportunitySync = async () => {
         deadline: toIsoDeadline(rec.deadline),
         tags: (rec.tags || []).slice(0, 12)
       };
+      s.officialUrl = safeUrl(rec.officialUrl);
+      if (rec.sourceUrl) s.sourceUrl = safeUrl(rec.sourceUrl);
       let status = s.deadline ? computeStatus(s.deadline) : "DEADLINE UNKNOWN";
       if (rec.status && /close/i.test(rec.status)) status = "CLOSED";
       const existing = await findExisting(s);
@@ -840,6 +1013,7 @@ var runOpportunitySync = async () => {
     }
   }
   const embedResult = await embedOpportunitiesBatched(pendingVecs);
+  invalidateOpportunityFeedCache();
   return {
     sources: sourceReports,
     inserted,
@@ -852,7 +1026,7 @@ var runOpportunitySync = async () => {
 };
 
 // src/controllers/launchController.ts
-var import_express = require("express");
+var import_express2 = require("express");
 
 // src/models/LaunchConfig.ts
 var import_mongoose2 = __toESM(require("mongoose"));
@@ -1028,34 +1202,97 @@ var setWhatsappGroup = async (req, res) => {
 
 // src/middleware/rateLimit.ts
 var import_express_rate_limit = __toESM(require("express-rate-limit"));
+
+// src/middleware/mongoStore.ts
+var import_mongoose4 = require("mongoose");
+var RateLimitSchema = new import_mongoose4.Schema(
+  {
+    _id: { type: String, required: true },
+    counter: { type: Number, required: true, default: 0 },
+    expiresAt: { type: Date, required: true }
+  },
+  { versionKey: false }
+);
+var RateLimitModel = null;
+var getModel = () => {
+  if (!RateLimitModel) {
+    RateLimitModel = (0, import_mongoose4.model)("RateLimit", RateLimitSchema);
+    RateLimitModel.collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch((err) => console.error("[rate-limit] Could not create TTL index:", err));
+  }
+  return RateLimitModel;
+};
+var MongoStore = class {
+  localKeys = false;
+  windowMs;
+  constructor() {
+    this.windowMs = 60 * 1e3;
+  }
+  init(options) {
+    this.windowMs = options.windowMs || this.windowMs;
+  }
+  // Optional read path used by the middleware if it needs the current count.
+  async get(key) {
+    const doc = await getModel().findOne({ _id: key }).lean().exec();
+    if (!doc) return void 0;
+    return { totalHits: doc.counter, resetTime: new Date(doc.expiresAt) };
+  }
+  async increment(key) {
+    try {
+      const expiresAt = new Date(Date.now() + this.windowMs);
+      const doc = await getModel().findOneAndUpdate(
+        { _id: key },
+        { $inc: { counter: 1 }, $setOnInsert: { expiresAt } },
+        { upsert: true, new: true }
+      ).lean().exec();
+      return { totalHits: doc?.counter ?? 1, resetTime: new Date(doc?.expiresAt ?? expiresAt) };
+    } catch (err) {
+      console.error("[rate-limit] increment failed, failing open:", err);
+      return { totalHits: 0, resetTime: new Date(Date.now() + this.windowMs) };
+    }
+  }
+  async decrement(key) {
+    try {
+      await getModel().updateOne({ _id: key, counter: { $gt: 0 } }, { $inc: { counter: -1 } }).exec();
+    } catch (err) {
+      console.error("[rate-limit] decrement failed:", err);
+    }
+  }
+  async resetKey(key) {
+    try {
+      await getModel().deleteOne({ _id: key }).exec();
+    } catch (err) {
+      console.error("[rate-limit] resetKey failed:", err);
+    }
+  }
+};
+
+// src/middleware/rateLimit.ts
 var errorJson = (req, res) => {
   res.status(429).json({ success: false, error: "Too many requests. Please try again shortly." });
 };
-var apiLimiter = (0, import_express_rate_limit.default)({
-  windowMs: 60 * 1e3,
-  limit: 120,
+var sharedStore = new MongoStore();
+var windowMs = 60 * 1e3;
+var baseOptions = (name, limit) => ({
+  windowMs,
+  limit,
   standardHeaders: true,
+  // Return rate limit info in `RateLimit-*` headers
   legacyHeaders: false,
-  handler: errorJson
+  // Disable the `X-RateLimit-*` headers
+  handler: errorJson,
+  store: sharedStore,
+  // req.ip is set by 'trust proxy' from the proxy chain; prefix it so each
+  // limiter owns a disjoint key space in the shared Mongo collection.
+  keyGenerator: (req) => `${name}:${req.ip || req.socket.remoteAddress || "unknown"}`
 });
-var strictLimiter = (0, import_express_rate_limit.default)({
-  windowMs: 60 * 1e3,
-  limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: errorJson
-});
-var sensitiveLimiter = (0, import_express_rate_limit.default)({
-  windowMs: 60 * 1e3,
-  limit: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: errorJson
-});
+var apiLimiter = (0, import_express_rate_limit.default)(baseOptions("api", 120));
+var strictLimiter = (0, import_express_rate_limit.default)(baseOptions("strict", 20));
+var sensitiveLimiter = (0, import_express_rate_limit.default)(baseOptions("sensitive", 5));
+var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(baseOptions("cv", 5));
 
 // src/lib/withLock.ts
-var import_mongoose4 = __toESM(require("mongoose"));
-var SyncLockSchema = new import_mongoose4.Schema(
+var import_mongoose5 = __toESM(require("mongoose"));
+var SyncLockSchema = new import_mongoose5.Schema(
   {
     _id: { type: String, required: true },
     // lock name
@@ -1065,7 +1302,7 @@ var SyncLockSchema = new import_mongoose4.Schema(
   },
   { versionKey: false }
 );
-var SyncLock = import_mongoose4.default.models.SyncLock || import_mongoose4.default.model("SyncLock", SyncLockSchema);
+var SyncLock = import_mongoose5.default.models.SyncLock || import_mongoose5.default.model("SyncLock", SyncLockSchema);
 var acquire = async (name, ttlMs, owner) => {
   const now = /* @__PURE__ */ new Date();
   const result = await SyncLock.findOneAndUpdate(
@@ -1095,119 +1332,6 @@ var withLock = async (name, ttlMs, fn) => {
 
 // src/routes/opportunityRoutes.ts
 var import_express3 = __toESM(require("express"));
-
-// src/controllers/opportunityController.ts
-var import_express2 = require("express");
-var MIN_SEARCH_SCORE = parseFloat(process.env.SEMANTIC_MIN_SCORE || "0.15");
-var tokenize = (text) => new Set(
-  text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t.length > 1)
-);
-var sharesToken = (doc, queryTokens) => {
-  const haystack = [
-    doc?.title,
-    doc?.organization,
-    doc?.category,
-    doc?.opportunityType,
-    doc?.location,
-    (doc?.tags || []).join(" ")
-  ].filter(Boolean).join(" ").toLowerCase();
-  for (const token of queryTokens) {
-    if (haystack.includes(token)) return true;
-  }
-  return false;
-};
-var getOpportunities = async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    const filter = {};
-    if (!req.query.status) {
-      filter.status = { $ne: "CLOSED" };
-    } else {
-      filter.status = req.query.status;
-    }
-    if (req.query.category) {
-      filter.category = req.query.category;
-    }
-    if (req.query.type) {
-      const types = req.query.type.split(",");
-      filter.opportunityType = { $in: types };
-    }
-    const searchText = (req.query.search || "").trim();
-    if (searchText) {
-      try {
-        const topK = Math.min(page * limit, 500);
-        const matches = (await semanticSearchOpportunities(searchText, topK)).filter((m) => m.score >= MIN_SEARCH_SCORE).slice(0, topK);
-        if (matches.length === 0) {
-          res.json({ success: true, count: 0, total: 0, page, pages: 0, data: [], semantic: true });
-          return;
-        }
-        const ids = matches.map((m) => m.id);
-        const scoreBy = new Map(matches.map((m) => [m.id, m.score]));
-        const docs = await Opportunity_default.find({ ...filter, _id: { $in: ids } });
-        const ordered = docs.map((doc) => ({ doc, score: scoreBy.get(doc._id.toString()) || 0 })).sort((a, b) => b.score - a.score).map((o) => o.doc);
-        const queryTokens = tokenize(searchText);
-        const relevant = queryTokens.size > 0 ? ordered.filter((doc) => sharesToken(doc, queryTokens)) : ordered;
-        const total2 = relevant.length;
-        const pageStart = (page - 1) * limit;
-        res.json({
-          success: true,
-          count: Math.min(limit, total2 - pageStart),
-          total: total2,
-          page,
-          pages: Math.ceil(total2 / limit),
-          data: relevant.slice(pageStart, pageStart + limit),
-          semantic: true
-        });
-        return;
-      } catch (error) {
-        console.error("Semantic search failed, falling back to text search:", error?.message || error);
-        filter.$text = { $search: searchText };
-      }
-    }
-    let sortQuery = { priorityScore: -1, dateDiscovered: -1 };
-    if (filter.$text) {
-      sortQuery = { score: { $meta: "textScore" } };
-    } else if (req.query.sort === "newest") {
-      sortQuery = { dateDiscovered: -1 };
-    } else if (req.query.sort === "deadline") {
-      sortQuery = { deadline: 1, dateDiscovered: -1 };
-    }
-    const opportunities = await Opportunity_default.find(filter).sort(sortQuery).skip(skip).limit(limit);
-    const total = await Opportunity_default.countDocuments(filter);
-    res.json({
-      success: true,
-      count: opportunities.length,
-      total,
-      page,
-      pages: Math.ceil(total / limit),
-      data: opportunities,
-      semantic: false
-    });
-  } catch (error) {
-    console.error("Error fetching opportunities:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server Error",
-      error: error.message
-    });
-  }
-};
-var getOpportunity = async (req, res) => {
-  try {
-    const opportunity = await Opportunity_default.findById(req.params.id);
-    if (!opportunity) {
-      res.status(404).json({ success: false, error: "Opportunity not found" });
-      return;
-    }
-    res.status(200).json({ success: true, data: opportunity });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Server Error" });
-  }
-};
-
-// src/routes/opportunityRoutes.ts
 var router = import_express3.default.Router();
 router.get("/", getOpportunities);
 router.get("/:id", getOpportunity);
@@ -1219,14 +1343,15 @@ var import_multer = __toESM(require("multer"));
 
 // src/controllers/aiController.ts
 var import_express4 = require("express");
-var import_mongoose8 = require("mongoose");
+var import_crypto = require("crypto");
+var import_mongoose9 = require("mongoose");
 var import_pdf_parse = require("pdf-parse");
 var import_pinecone2 = require("@pinecone-database/pinecone");
 var import_openai2 = __toESM(require("openai"));
 
 // src/models/Cv.ts
-var import_mongoose5 = __toESM(require("mongoose"));
-var CvSchema = new import_mongoose5.Schema(
+var import_mongoose6 = __toESM(require("mongoose"));
+var CvSchema = new import_mongoose6.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String },
@@ -1236,16 +1361,16 @@ var CvSchema = new import_mongoose5.Schema(
     fileData: { type: Buffer, required: true },
     text: { type: String },
     analysis: { type: String },
-    matchIds: [{ type: import_mongoose5.Schema.Types.ObjectId, ref: "Opportunity" }]
+    matchIds: [{ type: import_mongoose6.Schema.Types.ObjectId, ref: "Opportunity" }]
   },
   { timestamps: true }
 );
 CvSchema.index({ userId: 1, createdAt: -1 });
-var Cv_default = import_mongoose5.default.model("Cv", CvSchema);
+var Cv_default = import_mongoose6.default.model("Cv", CvSchema);
 
 // src/models/Mentorship.ts
-var import_mongoose6 = __toESM(require("mongoose"));
-var MentorshipSchema = new import_mongoose6.Schema(
+var import_mongoose7 = __toESM(require("mongoose"));
+var MentorshipSchema = new import_mongoose7.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String, trim: true, lowercase: true },
@@ -1260,7 +1385,7 @@ var MentorshipSchema = new import_mongoose6.Schema(
     mentorName: { type: String },
     amount: { type: Number, required: true, min: 0 },
     currency: { type: String, required: true, default: "NGN" },
-    provider: { type: String, enum: ["paystack", "demo"], required: true },
+    provider: { type: String, enum: ["paystack"], required: true },
     reference: { type: String, required: true, unique: true },
     status: { type: String, enum: ["paid", "pending", "failed"], default: "pending" },
     note: { type: String, trim: true }
@@ -1270,11 +1395,11 @@ var MentorshipSchema = new import_mongoose6.Schema(
 MentorshipSchema.index({ status: 1 });
 MentorshipSchema.index({ status: 1, mentorId: 1 });
 MentorshipSchema.index({ mentorId: 1, status: 1 });
-var Mentorship_default = import_mongoose6.default.model("Mentorship", MentorshipSchema);
+var Mentorship_default = import_mongoose7.default.model("Mentorship", MentorshipSchema);
 
 // src/models/MentorshipComplaint.ts
-var import_mongoose7 = __toESM(require("mongoose"));
-var MentorshipComplaintSchema = new import_mongoose7.Schema(
+var import_mongoose8 = __toESM(require("mongoose"));
+var MentorshipComplaintSchema = new import_mongoose8.Schema(
   {
     ticket: { type: String, required: true, unique: true },
     userId: { type: String, required: true, index: true },
@@ -1298,7 +1423,7 @@ var MentorshipComplaintSchema = new import_mongoose7.Schema(
   { timestamps: true }
 );
 MentorshipComplaintSchema.index({ status: 1, createdAt: -1 });
-var MentorshipComplaint_default = import_mongoose7.default.model("MentorshipComplaint", MentorshipComplaintSchema);
+var MentorshipComplaint_default = import_mongoose8.default.model("MentorshipComplaint", MentorshipComplaintSchema);
 
 // src/lib/cache.ts
 var LRUCache = class {
@@ -1332,6 +1457,7 @@ var LRUCache = class {
   }
 };
 var aiReplyCache = new LRUCache(300, 30 * 60 * 1e3);
+var embeddingCache = new LRUCache(2e3, 24 * 60 * 60 * 1e3);
 
 // ../shared/chatPolicies.ts
 var OFF_TOPIC_REFUSAL = "I don't have information on that in this jurisdiction. I can only help you with scholarships, internships, graduate trainee programmes, and fellowships on PrimeOpportunity.";
@@ -1454,6 +1580,18 @@ var nvidiaChatClient = new import_openai2.default({
   maxRetries: 1
 });
 var CV_NAMESPACE_PREFIX = "cvs-";
+var embedText = async (text) => {
+  const key = (0, import_crypto.createHash)("sha256").update(text).digest("hex");
+  const cached = embeddingCache.get(key);
+  if (cached) return cached;
+  const response = await nvidiaEmbedClient.embeddings.create({
+    model: "nvidia/nemotron-3-embed-1b",
+    input: text
+  });
+  const vector = response.data[0].embedding;
+  embeddingCache.set(key, vector);
+  return vector;
+};
 var handleMentorshipComplaint = async (message, userId, userEmail, userName) => {
   const ticket = makeTicket();
   try {
@@ -1493,6 +1631,25 @@ var chunkText = (text, chunkSize = 1e3, overlap = 150) => {
   }
   return chunks;
 };
+var namespaceLocks = /* @__PURE__ */ new Map();
+async function withNamespaceLock(namespace, fn) {
+  const previous = namespaceLocks.get(namespace) ?? Promise.resolve();
+  let releaseLock;
+  const current = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  const tail = previous.then(() => current);
+  namespaceLocks.set(namespace, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+    if (namespaceLocks.get(namespace) === tail) {
+      namespaceLocks.delete(namespace);
+    }
+  }
+}
 var seedUserCvVectors = async (cvText, userId, cvId, fileName) => {
   const namespace = `${CV_NAMESPACE_PREFIX}${userId}`;
   const index = pinecone2.index(INDEX_NAME2);
@@ -1529,6 +1686,11 @@ var analyzeCV = async (req, res) => {
       res.status(400).json({ success: false, message: "No CV file uploaded." });
       return;
     }
+    const PDF_MAGIC = Buffer.from("%PDF-", "utf8");
+    if (!req.file.buffer.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC)) {
+      res.status(400).json({ success: false, message: "Only PDF files are allowed." });
+      return;
+    }
     const parser = new import_pdf_parse.PDFParse({ data: req.file.buffer });
     const pdfData = await parser.getText();
     await parser.destroy();
@@ -1538,11 +1700,7 @@ var analyzeCV = async (req, res) => {
       return;
     }
     const truncatedCVText = cvText.substring(0, 4e3);
-    const embedResponse = await nvidiaEmbedClient.embeddings.create({
-      model: "nvidia/nemotron-3-embed-1b",
-      input: truncatedCVText
-    });
-    const cvVector = embedResponse.data[0].embedding;
+    const cvVector = await embedText(truncatedCVText);
     const index = pinecone2.index(INDEX_NAME2);
     const queryResponse = await index.query({
       vector: cvVector,
@@ -1585,7 +1743,7 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     if (userId) {
       const cv = new Cv_default({
         userId,
-        userEmail: req.body.userEmail || "",
+        userEmail: req.authUser.email || "",
         userName: req.body.userName || "",
         fileName: req.file.originalname,
         contentType: req.file.mimetype,
@@ -1597,7 +1755,11 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       await cv.save();
       savedCv = cv;
       try {
-        await seedUserCvVectors(cvText, userId, savedCv._id.toString(), req.file.originalname);
+        const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
+        await withNamespaceLock(
+          cvNamespace,
+          () => seedUserCvVectors(cvText, userId, savedCv._id.toString(), req.file.originalname)
+        );
       } catch (vecErr) {
         console.error("Could not seed CV vectors to Pinecone:", vecErr);
       }
@@ -1624,10 +1786,14 @@ var chatWithAI = async (req, res) => {
       res.status(400).json({ success: false, message: "Message is required." });
       return;
     }
+    if (message.length > 2e3) {
+      res.status(400).json({ success: false, message: "Message exceeds the 2000 character limit." });
+      return;
+    }
     const rawHistory = Array.isArray(req.body.history) ? req.body.history : [];
     const history = rawHistory.filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-10);
     const userId = req.authUser.uid;
-    const userEmail = (req.body?.userEmail || req.authUser.email || "").trim();
+    const userEmail = (req.authUser.email || "").trim();
     const userName = (req.body?.userName || "").trim();
     const stream = req.body?.stream === true;
     const startSse = () => {
@@ -1653,7 +1819,7 @@ var chatWithAI = async (req, res) => {
     if (stream) {
       startSse();
     }
-    const cacheKey = `${userId}|${message}`;
+    const cacheKey = (0, import_crypto.createHash)("sha256").update(`${userId}|${message}`).digest("hex");
     const cached = aiReplyCache.get(cacheKey);
     if (cached) {
       return respondDone(cached.reply);
@@ -1673,17 +1839,16 @@ var chatWithAI = async (req, res) => {
         { type: "mentorship" }
       );
     }
-    const embedResponse = await nvidiaEmbedClient.embeddings.create({
-      model: "nvidia/nemotron-3-embed-1b",
-      input: message
-    });
-    const messageVector = embedResponse.data[0].embedding;
+    const messageVector = await embedText(message);
     const index = pinecone2.index(INDEX_NAME2);
-    const queryResponse = await index.query({
-      vector: messageVector,
-      topK: 5,
-      includeMetadata: true
-    });
+    const cvNamespace = userId ? `${CV_NAMESPACE_PREFIX}${userId}` : null;
+    const [queryResponse, cvQuery] = await Promise.all([
+      index.query({ vector: messageVector, topK: 5, includeMetadata: true }),
+      cvNamespace ? index.namespace(cvNamespace).query({ vector: messageVector, topK: 4, includeMetadata: true }).catch((err) => {
+        console.error("Could not query user CV namespace:", err?.message || err);
+        return null;
+      }) : Promise.resolve(null)
+    ]);
     const matchIds = queryResponse.matches.map((match) => match.id);
     let retrievedContext = "No specific opportunities were retrieved for this question. Answer generally using your knowledge.";
     if (matchIds.length > 0) {
@@ -1694,32 +1859,38 @@ var chatWithAI = async (req, res) => {
       }
     }
     let userCvContext = "";
-    if (userId) {
+    if (userId && cvNamespace) {
       try {
-        const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
-        let cvQuery = await index.namespace(cvNamespace).query({
-          vector: messageVector,
-          topK: 4,
-          includeMetadata: true
-        });
-        let cvChunks = cvQuery.matches.filter((match) => match.metadata && typeof match.metadata.text === "string").map((match) => match.metadata.text);
+        let cvChunks = (cvQuery?.matches || []).filter((match) => match.metadata && typeof match.metadata.text === "string").map((match) => match.metadata.text);
         if (cvChunks.length === 0) {
-          const existingCv = await Cv_default.findOne({ userId }).sort({ createdAt: -1 }).select("text fileName _id");
-          if (existingCv) {
-            console.log(`Self-healing CV vectors for userId=${userId}...`);
-            await seedUserCvVectors(
-              existingCv.text,
-              userId,
-              existingCv._id.toString(),
-              existingCv.fileName
-            );
-            cvQuery = await index.namespace(cvNamespace).query({
+          await withNamespaceLock(cvNamespace, async () => {
+            const recheck = await index.namespace(cvNamespace).query({
               vector: messageVector,
               topK: 4,
               includeMetadata: true
             });
-            cvChunks = cvQuery.matches.filter((match) => match.metadata && typeof match.metadata.text === "string").map((match) => match.metadata.text);
-          }
+            const recheckChunks = recheck.matches.filter((match) => match.metadata && typeof match.metadata.text === "string").map((match) => match.metadata.text);
+            if (recheckChunks.length > 0) {
+              cvChunks = recheckChunks;
+              return;
+            }
+            const existingCv = await Cv_default.findOne({ userId }).sort({ createdAt: -1 }).select("text fileName _id");
+            if (existingCv) {
+              console.log(`Self-healing CV vectors for userId=${userId}...`);
+              await seedUserCvVectors(
+                existingCv.text,
+                userId,
+                existingCv._id.toString(),
+                existingCv.fileName
+              );
+              const healedQuery = await index.namespace(cvNamespace).query({
+                vector: messageVector,
+                topK: 4,
+                includeMetadata: true
+              });
+              cvChunks = healedQuery.matches.filter((match) => match.metadata && typeof match.metadata.text === "string").map((match) => match.metadata.text);
+            }
+          });
         }
         if (cvChunks.length > 0) {
           userCvContext = cvChunks.join("\n\n");
@@ -1932,7 +2103,7 @@ var downloadCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose9.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -1954,7 +2125,7 @@ var deleteCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose9.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -1978,7 +2149,7 @@ var deleteCV = async (req, res) => {
 var getRetrievedOpportunityContext = async (req, res) => {
   try {
     const rawIds = req.body?.ids;
-    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose8.isValidObjectId)(id)).slice(0, 8) : [];
+    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose9.isValidObjectId)(id)).slice(0, 8) : [];
     if (ids.length === 0) {
       return res.json({ success: true, context: null });
     }
@@ -2030,8 +2201,8 @@ var getAdminAuth = () => {
 };
 
 // src/models/AppUser.ts
-var import_mongoose9 = __toESM(require("mongoose"));
-var AppUserSchema = new import_mongoose9.Schema(
+var import_mongoose10 = __toESM(require("mongoose"));
+var AppUserSchema = new import_mongoose10.Schema(
   {
     uid: { type: String, required: true, unique: true, index: true },
     email: { type: String, trim: true, lowercase: true },
@@ -2048,7 +2219,7 @@ var AppUserSchema = new import_mongoose9.Schema(
   },
   { timestamps: true }
 );
-var AppUser_default = import_mongoose9.default.model("AppUser", AppUserSchema);
+var AppUser_default = import_mongoose10.default.model("AppUser", AppUserSchema);
 
 // src/middleware/auth.ts
 var BEARER_RE = /^Bearer\s+(.+)$/i;
@@ -2105,15 +2276,21 @@ var upload = (0, import_multer.default)({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 },
   // 5MB limit
+  // First boundary layer: accept only PDF-claimed uploads. Note multer's
+  // fileFilter runs BEFORE the file buffer exists, so it can only trust the
+  // declared Content-Type — browsers legitimately send application/pdf, but
+  // some clients label PDFs as application/octet-stream. The authoritative
+  // check is the %PDF- magic-byte gate in analyzeCV, which runs on the actual
+  // buffer before pdf-parse (second boundary layer).
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === "application/pdf") {
+    if (file.mimetype === "application/pdf" || file.mimetype === "application/octet-stream") {
       cb(null, true);
     } else {
       cb(new Error("Only PDF files are allowed"));
     }
   }
 });
-router2.post("/analyze-cv", requireAuth, upload.single("cv"), analyzeCV);
+router2.post("/analyze-cv", cvAnalyzeLimiter, requireAuth, upload.single("cv"), analyzeCV);
 router2.get("/my-cvs", requireAuth, getMyCVs);
 router2.get("/cv/:cvId/download", requireAuth, downloadCV);
 router2.delete("/cv/:cvId", requireAuth, deleteCV);
@@ -2129,8 +2306,8 @@ var import_express7 = __toESM(require("express"));
 var import_express6 = require("express");
 
 // src/models/Mentor.ts
-var import_mongoose10 = __toESM(require("mongoose"));
-var MentorSchema = new import_mongoose10.Schema(
+var import_mongoose11 = __toESM(require("mongoose"));
+var MentorSchema = new import_mongoose11.Schema(
   {
     userId: { type: String, required: true, unique: true, index: true },
     name: { type: String },
@@ -2143,7 +2320,7 @@ var MentorSchema = new import_mongoose10.Schema(
   { timestamps: true }
 );
 MentorSchema.index({ status: 1 });
-var Mentor_default = import_mongoose10.default.model("Mentor", MentorSchema);
+var Mentor_default = import_mongoose11.default.model("Mentor", MentorSchema);
 
 // src/controllers/mentorController.ts
 var MENTOR_CUT = 0.9;
@@ -2242,13 +2419,41 @@ var getMentorDashboard = async (req, res) => {
       return;
     }
     const myMentees = await Mentorship_default.find({ mentorId: userId, status: "paid" }).sort({ createdAt: -1 }).lean();
-    const openRequests = await Mentorship_default.find({ status: "paid", mentorId: null }).sort({ createdAt: -1 }).lean();
+    const openRequests = await Mentorship_default.find(
+      { status: "paid", mentorId: null },
+      {
+        _id: 1,
+        opportunityId: 1,
+        opportunityTitle: 1,
+        opportunityOrg: 1,
+        opportunityType: 1,
+        opportunityCategory: 1,
+        userName: 1,
+        amount: 1,
+        currency: 1,
+        note: 1,
+        createdAt: 1
+      }
+    ).sort({ createdAt: -1 }).lean();
     const totalPaid = myMentees.reduce((sum, m) => sum + (m.amount || 0), 0);
+    const redactOpenRequest = (r) => ({
+      _id: r._id,
+      opportunityId: r.opportunityId || null,
+      opportunityTitle: r.opportunityTitle || "",
+      opportunityOrg: r.opportunityOrg || "",
+      opportunityType: r.opportunityType || "",
+      opportunityCategory: r.opportunityCategory || "",
+      userName: r.userName ? `${r.userName.charAt(0)}***` : "",
+      amount: r.amount || 0,
+      currency: r.currency || "NGN",
+      note: r.note || "",
+      createdAt: r.createdAt
+    });
     res.json({
       success: true,
       mentor,
       myMentees,
-      openRequests,
+      openRequests: openRequests.map(redactOpenRequest),
       totalMentees: myMentees.length,
       totalEarned: totalPaid * MENTOR_CUT
     });
@@ -2268,9 +2473,15 @@ var mentorRoutes_default = router3;
 // src/routes/syncRoutes.ts
 var import_express8 = __toESM(require("express"));
 var router4 = import_express8.default.Router();
+var SYNC_LOCK_NAME = "opportunity-sync";
+var SYNC_LOCK_TTL_MS = 45 * 60 * 1e3;
 router4.post("/run", requireAdmin, async (_req, res) => {
   try {
-    const result = await runOpportunitySync();
+    const result = await withLock(SYNC_LOCK_NAME, SYNC_LOCK_TTL_MS, runOpportunitySync);
+    if (!result) {
+      res.status(409).json({ success: false, error: "A sync is already running. Try again shortly." });
+      return;
+    }
     res.json({ success: true, result });
   } catch (error) {
     console.error("Manual sync failed:", error);
@@ -2286,11 +2497,11 @@ var import_express10 = __toESM(require("express"));
 var import_express9 = require("express");
 
 // src/models/Application.ts
-var import_mongoose11 = __toESM(require("mongoose"));
-var ApplicationSchema = new import_mongoose11.Schema(
+var import_mongoose12 = __toESM(require("mongoose"));
+var ApplicationSchema = new import_mongoose12.Schema(
   {
     userId: { type: String, required: true, index: true },
-    opportunityId: { type: import_mongoose11.Schema.Types.ObjectId, ref: "Opportunity", required: true },
+    opportunityId: { type: import_mongoose12.Schema.Types.ObjectId, ref: "Opportunity", required: true },
     status: {
       type: String,
       enum: ["saved", "applied", "interview", "accepted", "rejected"],
@@ -2303,7 +2514,7 @@ var ApplicationSchema = new import_mongoose11.Schema(
   { timestamps: true }
 );
 ApplicationSchema.index({ opportunityId: 1, userId: 1 }, { unique: true });
-var Application_default = import_mongoose11.default.model("Application", ApplicationSchema);
+var Application_default = import_mongoose12.default.model("Application", ApplicationSchema);
 
 // src/controllers/applicationController.ts
 var VALID_STATUSES = ["saved", "applied", "interview", "accepted", "rejected"];
@@ -2426,21 +2637,16 @@ var createMentorshipRequest = async (req, res) => {
     if (!reference) {
       return res.status(400).json({ success: false, error: "Payment reference is required." });
     }
-    if (provider !== "paystack" && provider !== "demo") {
+    if (provider !== "paystack") {
       return res.status(400).json({ success: false, error: "Unknown payment provider." });
     }
-    let status;
-    if (provider === "demo") {
-      status = "paid";
-    } else {
-      if (!process.env.PAYSTACK_SECRET_KEY) {
-        return res.status(400).json({
-          success: false,
-          error: "Card payments are not enabled yet. Please try again later."
-        });
-      }
-      status = "pending";
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(400).json({
+        success: false,
+        error: "Card payments are not enabled yet. Please try again later."
+      });
     }
+    let status = "pending";
     const expectedAmount = GUIDANCE_AMOUNT;
     const finalAmount = Number(amount);
     if (!Number.isFinite(finalAmount) || finalAmount < 0) {
@@ -2605,7 +2811,7 @@ var import_express16 = __toESM(require("express"));
 
 // src/controllers/adminController.ts
 var import_express15 = require("express");
-var import_mongoose12 = require("mongoose");
+var import_mongoose13 = require("mongoose");
 var PLATFORM_CUT = 0.1;
 var getOverview = async (_req, res) => {
   try {
@@ -2755,7 +2961,7 @@ var listComplaints = async (req, res) => {
 var resolveComplaint = async (req, res) => {
   try {
     const { id } = req.params;
-    if (!(0, import_mongoose12.isValidObjectId)(id)) {
+    if (!(0, import_mongoose13.isValidObjectId)(id)) {
       return res.status(400).json({ success: false, error: "Invalid complaint id." });
     }
     const complaint = await MentorshipComplaint_default.findByIdAndUpdate(
@@ -2825,8 +3031,9 @@ var launchRoutes_default = router9;
 // src/index.ts
 var app2 = (0, import_express18.default)();
 var port = process.env.PORT || 5e3;
-app2.set("trust proxy", 1);
+app2.set("trust proxy", true);
 app2.use((0, import_helmet.default)());
+app2.use((0, import_compression.default)());
 var defaultOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
 var configuredOrigins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
 var allowedOrigins = configuredOrigins.length > 0 ? configuredOrigins : defaultOrigins;
@@ -2904,14 +3111,14 @@ var scheduleLaunchCheck = () => {
     }
   });
 };
-import_mongoose13.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 }).then(() => {
+import_mongoose14.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 }).then(() => {
   console.log("Connected to MongoDB");
   scheduleOpportunitySync();
   scheduleLaunchCheck();
 }).catch((error) => {
   console.error("MongoDB connection error. Running in mock mode.", error.message);
   console.log("Opportunity sync requires MongoDB \u2014 it will start once the database reconnects.");
-  import_mongoose13.default.connection.on("connected", () => {
+  import_mongoose14.default.connection.on("connected", () => {
     scheduleOpportunitySync();
     scheduleLaunchCheck();
   });

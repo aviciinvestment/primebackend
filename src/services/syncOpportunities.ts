@@ -1,4 +1,5 @@
 import Opportunity from '../models/Opportunity';
+import { invalidateOpportunityFeedCache } from '../controllers/opportunityController';
 import {
   getSourceAdapters,
   SourceOpportunity,
@@ -12,6 +13,24 @@ import {
 } from './opportunityVectorService';
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Only http/https external URLs are ever stored. Anything else (javascript:,
+// data:, file:, vbscript:, blob:, or an empty/garbage value) is dropped so a
+// compromised feed can't inject unsafe schemes into listings users click.
+// Defense-in-depth: block executable schemes explicitly before the URL parser
+// runs, then confirm the surviving value is plain http(s).
+const unsafeScheme = /^(?:java|vb|js)?script:|^data:|^file:|^blob:|\s/i;
+
+const safeUrl = (url?: string | null): string => {
+  const raw = String(url || '').trim();
+  if (!raw || unsafeScheme.test(raw)) return '';
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? raw : '';
+  } catch {
+    return '';
+  }
+};
 
 const cleanDescription = (text: string): string =>
   text
@@ -107,6 +126,9 @@ export const runOpportunitySync = async (): Promise<SyncResult> => {
         deadline: toIsoDeadline(rec.deadline),
         tags: (rec.tags || []).slice(0, 12),
       };
+      // Sanitize external URLs before they reach the DB (see safeUrl above).
+      s.officialUrl = safeUrl(rec.officialUrl);
+      if (rec.sourceUrl) s.sourceUrl = safeUrl(rec.sourceUrl);
 
       // Status: external "closed" hint wins; otherwise drive from the deadline.
       let status = s.deadline ? computeStatus(s.deadline) : 'DEADLINE UNKNOWN';
@@ -205,6 +227,10 @@ export const runOpportunitySync = async (): Promise<SyncResult> => {
 
   // Embed new/changed docs into Pinecone immediately, in small batches.
   const embedResult = await embedOpportunitiesBatched(pendingVecs);
+
+  // The public feed is cached in memory for 60s (P-01); drop it now so the
+  // just-committed insertions/updates/closures show up on the next request.
+  invalidateOpportunityFeedCache();
 
   return {
     sources: sourceReports,

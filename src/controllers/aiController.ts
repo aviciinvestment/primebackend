@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { createHash } from 'crypto';
 import { isValidObjectId } from 'mongoose';
 import { PDFParse } from 'pdf-parse';
 import { Pinecone } from '@pinecone-database/pinecone';
@@ -7,7 +8,7 @@ import Opportunity from '../models/Opportunity';
 import Cv from '../models/Cv';
 import Mentorship from '../models/Mentorship';
 import MentorshipComplaint from '../models/MentorshipComplaint';
-import { aiReplyCache } from '../lib/cache';
+import { aiReplyCache, embeddingCache } from '../lib/cache';
 import {
   OFF_TOPIC_REFUSAL,
   isOffTopic,
@@ -39,6 +40,25 @@ const nvidiaChatClient = new OpenAI({
 // This guarantees a chat query can never retrieve another user's CV data,
 // even if a malicious request is made.
 const CV_NAMESPACE_PREFIX = 'cvs-';
+
+// Embed a single text string, serving repeat inputs from the local embedding
+// cache instead of the paid NVIDIA endpoint. The key is a SHA-256 hash of the
+// raw text so no identifiable/PII text is stored, and identical repeated
+// questions (across users) skip the embed API call entirely. Embeddings are
+// content-derived and safe to share, so the key carries no user scope.
+const embedText = async (text: string): Promise<number[]> => {
+  const key = createHash('sha256').update(text).digest('hex');
+  const cached = embeddingCache.get(key);
+  if (cached) return cached;
+
+  const response = await nvidiaEmbedClient.embeddings.create({
+    model: 'nvidia/nemotron-3-embed-1b',
+    input: text,
+  });
+  const vector = response.data[0].embedding;
+  embeddingCache.set(key, vector);
+  return vector;
+};
 
 // Deterministic guardrail + intent detection lives in shared/chatPolicies.ts so
 // the Cloudflare Worker and this server always agree. Do not duplicate it here.
@@ -90,6 +110,42 @@ const chunkText = (text: string, chunkSize = 1000, overlap = 150): string[] => {
   return chunks;
 };
 
+// Per-namespace async mutex for CV vector seeding.
+// Keyed by the Pinecone namespace (cvs-<userId>) so concurrent requests from
+// the SAME user serialize their deleteAll -> embed -> upsert cycle — only the
+// first to arrive performs it; the rest queue, then re-check and reuse the
+// seeded vectors. Namespaces of different users never contend with each other.
+//
+// Implementation: a promise-chain tail per key. `tail` is stored in the map so
+// the next caller chains its own acquisition onto the previous holder. The map
+// entry is removed once its holder finishes AND no newer waiter has since
+// taken its place — so the map stays bounded (no leaks). Every path releases
+// the lock in `finally`, so a failed/concurrent seed can never deadlock the
+// queue for that user.
+const namespaceLocks = new Map<string, Promise<void>>();
+
+async function withNamespaceLock<T>(namespace: string, fn: () => Promise<T>): Promise<T> {
+  const previous = namespaceLocks.get(namespace) ?? Promise.resolve();
+  let releaseLock!: () => void;
+  const current = new Promise<void>(resolve => {
+    releaseLock = resolve;
+  });
+  const tail = previous.then(() => current);
+  namespaceLocks.set(namespace, tail);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+    // If a newer waiter replaced our tail while we ran, leave their entry in
+    // place; otherwise drop ours so the map never grows unbounded.
+    if (namespaceLocks.get(namespace) === tail) {
+      namespaceLocks.delete(namespace);
+    }
+  }
+}
+
 // Store a user's CV as chunked vectors in their private Pinecone namespace.
 // Any previous CV vectors for this user are removed, so the namespace always
 // reflects their most recent CV.
@@ -99,12 +155,12 @@ const seedUserCvVectors = async (
   cvId: string,
   fileName: string
 ): Promise<{ namespace: string; chunks: number }> => {
-const namespace = `${CV_NAMESPACE_PREFIX}${userId}`;
+  const namespace = `${CV_NAMESPACE_PREFIX}${userId}`;
   const index = pinecone.index(INDEX_NAME);
 
   // Delete this user's previous CV vectors (refreshes their private namespace).
   // The namespace may not exist yet on first upload — that is fine, skip it.
-try {
+  try {
     await index.namespace(namespace).deleteAll();
   } catch (err: any) {
     if (err?.name !== 'PineconeNotFoundError') {
@@ -137,8 +193,17 @@ try {
 
 export const analyzeCV = async (req: Request, res: Response) => {
   try {
-    if (!req.file) {
+if (!req.file) {
       res.status(400).json({ success: false, message: 'No CV file uploaded.' });
+      return;
+    }
+
+    // The multer check only trusts the declared Content-Type; verify the file
+    // is actually a PDF by its magic bytes (%PDF-) so a renamed payload is
+    // rejected before pdf-parse ever sees it.
+    const PDF_MAGIC = Buffer.from('%PDF-', 'utf8');
+    if (!req.file.buffer.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC)) {
+      res.status(400).json({ success: false, message: 'Only PDF files are allowed.' });
       return;
     }
 
@@ -156,12 +221,8 @@ export const analyzeCV = async (req: Request, res: Response) => {
     // We limit the text to the first 4000 characters to avoid huge embedding token limits
     const truncatedCVText = cvText.substring(0, 4000);
 
-    // 2. Generate Embedding for the CV
-    const embedResponse = await nvidiaEmbedClient.embeddings.create({
-      model: 'nvidia/nemotron-3-embed-1b',
-      input: truncatedCVText,
-    });
-    const cvVector = embedResponse.data[0].embedding;
+// 2. Generate Embedding for the CV (cache-backed).
+    const cvVector = await embedText(truncatedCVText);
 
     // 3. Query Pinecone for Top Matches
     const index = pinecone.index(INDEX_NAME);
@@ -212,9 +273,9 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     const userId = req.authUser!.uid;
     let savedCv: any = null;
     if (userId) {
-      const cv = new Cv({
+const cv = new Cv({
         userId,
-        userEmail: req.body.userEmail || '',
+        userEmail: req.authUser!.email || '',
         userName: req.body.userName || '',
         fileName: req.file.originalname,
         contentType: req.file.mimetype,
@@ -226,11 +287,16 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       await cv.save();
       savedCv = cv;
 
-      // 5b. Vectorize the CV into the user's private Pinecone namespace so the
+// 5b. Vectorize the CV into the user's private Pinecone namespace so the
       // chat assistant has personalized context. Failure here must NOT block
-      // the CV analysis result.
+      // the CV analysis result. Runs under the per-namespace lock so an upload
+      // that races a chat self-heal on the same user's namespace serializes
+      // instead of interleaving delete/upsert writes.
       try {
-        await seedUserCvVectors(cvText, userId, savedCv._id.toString(), req.file.originalname);
+        const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
+        await withNamespaceLock(cvNamespace, () =>
+          seedUserCvVectors(cvText, userId, savedCv._id.toString(), req.file.originalname)
+        );
       } catch (vecErr) {
         console.error('Could not seed CV vectors to Pinecone:', vecErr);
       }
@@ -263,9 +329,16 @@ type SseFrame = Record<string, unknown>;
 
 export const chatWithAI = async (req: Request, res: Response) => {
   try {
+    // Strict cap on the incoming message (S14): bound embed + LLM token cost
+    // per request and prevent oversized-payload resource exhaustion. Over-limit
+    // input is rejected outright rather than silently truncated — fail closed.
     const message = ((req.body?.message as string) || '').trim();
     if (!message) {
       res.status(400).json({ success: false, message: 'Message is required.' });
+      return;
+    }
+    if (message.length > 2000) {
+      res.status(400).json({ success: false, message: 'Message exceeds the 2000 character limit.' });
       return;
     }
 
@@ -278,7 +351,10 @@ export const chatWithAI = async (req: Request, res: Response) => {
     // Identity comes from the verified Firebase token, never the request body.
     // userId scope is enforced by querying ONLY that user's private Pinecone namespace.
     const userId = req.authUser!.uid;
-    const userEmail = ((req.body?.userEmail as string) || req.authUser!.email || '').trim();
+    // S-07: the user's email is taken exclusively from the verified token payload —
+    // a client-supplied body field can be spoofed, so it is never used to identify,
+    // store, or address the user.
+    const userEmail = (req.authUser!.email || '').trim();
     const userName = ((req.body?.userName as string) || '').trim();
 
     const stream = req.body?.stream === true;
@@ -311,7 +387,9 @@ export const chatWithAI = async (req: Request, res: Response) => {
     }
 
     // --- in-memory cache: replay an identical recent request instantly ---
-    const cacheKey = `${userId}|${message}`;
+    // Key is a SHA-256 hash of uid|message so raw conversation text / PII is
+    // never held in server memory, and the key stays bounded in length.
+    const cacheKey = createHash('sha256').update(`${userId}|${message}`).digest('hex');
     const cached = aiReplyCache.get(cacheKey);
     if (cached) {
       return respondDone(cached.reply);
@@ -341,20 +419,28 @@ export const chatWithAI = async (req: Request, res: Response) => {
       );
     }
 
-    // 1. Generate Embedding for the user's message
-    const embedResponse = await nvidiaEmbedClient.embeddings.create({
-      model: 'nvidia/nemotron-3-embed-1b',
-      input: message,
-    });
-    const messageVector = embedResponse.data[0].embedding;
+    // 1. Generate Embedding for the user's message (cache-backed).
+    const messageVector = await embedText(message);
 
-    // 2. Query Pinecone for relevant opportunities
+    // 2+4. Query Pinecone for opportunities AND the user's own CV in parallel —
+    //     both are independent lookups keyed on the same message vector, so
+    //     doing them concurrently cuts ~one full Pinecone RTT off every request.
     const index = pinecone.index(INDEX_NAME);
-    const queryResponse = await index.query({
-      vector: messageVector,
-      topK: 5,
-      includeMetadata: true,
-    });
+    const cvNamespace = userId ? `${CV_NAMESPACE_PREFIX}${userId}` : null;
+
+    const [queryResponse, cvQuery] = await Promise.all([
+      index.query({ vector: messageVector, topK: 5, includeMetadata: true }),
+      cvNamespace
+        ? index
+            .namespace(cvNamespace)
+            .query({ vector: messageVector, topK: 4, includeMetadata: true })
+            .catch((err: any) => {
+              // A missing/empty CV namespace must never fail the pipeline.
+              console.error('Could not query user CV namespace:', err?.message || err);
+              return null;
+            })
+        : Promise.resolve(null),
+    ]);
 
     const matchIds = queryResponse.matches.map(match => match.id);
 
@@ -371,47 +457,61 @@ export const chatWithAI = async (req: Request, res: Response) => {
       }
     }
 
-    // 4. Retrieve the requesting user's OWN CV from their private namespace
-    //    (only ever this user's vectors — never another user's)
+    // 4. Build CV context from the user's private namespace (never another
+    //    user's). Only the self-heal re-query stays sequential.
     let userCvContext = '';
-    if (userId) {
+    if (userId && cvNamespace) {
       try {
-        const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
-        let cvQuery = await index.namespace(cvNamespace).query({
-          vector: messageVector,
-          topK: 4,
-          includeMetadata: true,
-        });
-
-        let cvChunks = cvQuery.matches
+        let cvChunks = (cvQuery?.matches || [])
           .filter(match => match.metadata && typeof match.metadata.text === 'string')
           .map(match => match.metadata!.text as string);
 
         // Self-heal: the user has a CV stored but it was never vectorized
         // (e.g. uploaded before namespace seeding existed, or a transient seed
-        // failure). Vectorize their most recent CV on demand so the assistant
-        // always has the current user's own context.
+        // failure). The WHOLE find+seed+requery runs under a per-namespace
+        // mutex so that when several messages arrive concurrently, only the
+        // first performs the deleteAll -> embed -> upsert sequence and the
+        // others queue, then reuse the freshly seeded vectors instead of
+        // triggering a storm of racing writes on the shared index.
         if (cvChunks.length === 0) {
-          const existingCv = await Cv.findOne({ userId })
-            .sort({ createdAt: -1 })
-            .select('text fileName _id');
-          if (existingCv) {
-            console.log(`Self-healing CV vectors for userId=${userId}...`);
-            await seedUserCvVectors(
-              existingCv.text,
-              userId,
-              existingCv._id.toString(),
-              existingCv.fileName
-            );
-            cvQuery = await index.namespace(cvNamespace).query({
+          await withNamespaceLock(cvNamespace, async () => {
+            // Re-check while holding the lock: an earlier concurrent request
+            // may have completed the seed while we were queued — in that case
+            // the vectors already exist and there is nothing to rebuild.
+            const recheck = await index.namespace(cvNamespace).query({
               vector: messageVector,
               topK: 4,
               includeMetadata: true,
             });
-            cvChunks = cvQuery.matches
+            const recheckChunks = recheck.matches
               .filter(match => match.metadata && typeof match.metadata.text === 'string')
               .map(match => match.metadata!.text as string);
-          }
+            if (recheckChunks.length > 0) {
+              cvChunks = recheckChunks;
+              return;
+            }
+
+            const existingCv = await Cv.findOne({ userId })
+              .sort({ createdAt: -1 })
+              .select('text fileName _id');
+            if (existingCv) {
+              console.log(`Self-healing CV vectors for userId=${userId}...`);
+              await seedUserCvVectors(
+                existingCv.text,
+                userId,
+                existingCv._id.toString(),
+                existingCv.fileName
+              );
+              const healedQuery = await index.namespace(cvNamespace).query({
+                vector: messageVector,
+                topK: 4,
+                includeMetadata: true,
+              });
+              cvChunks = healedQuery.matches
+                .filter(match => match.metadata && typeof match.metadata.text === 'string')
+                .map(match => match.metadata!.text as string);
+            }
+          });
         }
 
         if (cvChunks.length > 0) {

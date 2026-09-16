@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import mongoose from 'mongoose';
 import cron from 'node-cron';
@@ -13,14 +14,19 @@ import { withLock } from './lib/withLock';
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Behind a reverse proxy (Fly.io / Railway / Render / a VPS load balancer),
-// Express must trust the first hop so req.ip / rate limiter IPs come from
-// X-Forwarded-For instead of treating every visitor as the proxy's IP. Only
-// the first hop is trusted; the proxy is what users actually connect to.
-app.set('trust proxy', 1);
+// Behind a reverse proxy (Render LB / Cloudflare / a VPS load balancer),
+// Express must trust upstream headers so req.ip / rate limiter IPs come from
+// X-Forwarded-For / CF-Connecting-IP instead of treating everyone as the
+// proxy's IP. Trust all hops: the Mongo-backed rate limiter then keys on the
+// real client IP forwarded through the Worker's CF-Connecting-IP header.
+app.set('trust proxy', true);
 
 // Security headers.
 app.use(helmet());
+
+// Gzip JSON responses (opportunity arrays are large). Runs early so the
+// compressed stream flows through the rest of the middleware unchanged.
+app.use(compression());
 
 // Strict CORS allow-list. Without CORS_ORIGIN we only permit the local dev
 // frontends; production origins go in CORS_ORIGIN (comma-separated), or * to

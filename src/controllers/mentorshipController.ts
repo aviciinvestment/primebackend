@@ -38,26 +38,24 @@ export const createMentorshipRequest = async (req: Request, res: Response) => {
     if (!reference) {
       return res.status(400).json({ success: false, error: 'Payment reference is required.' });
     }
-    if (provider !== 'paystack' && provider !== 'demo') {
+
+    // Only real Paystack transactions are accepted. The deprecated 'demo'
+    // provider (which auto-marked requests as paid without money changing
+    // hands) is closed so a request can never reach 'paid' without a genuine,
+    // server-verified payment.
+    if (provider !== 'paystack') {
       return res.status(400).json({ success: false, error: 'Unknown payment provider.' });
     }
-
-    // The server (never the client) decides whether a request counts as paid.
-    let status: 'paid' | 'pending' | 'failed';
-    if (provider === 'demo') {
-      // Demo automatically "pays" so the flow can be exercised end-to-end.
-      status = 'paid';
-    } else {
-      // Real Paystack: only accept once the secret key is configured, and leave
-      // payment confirmation to server-side verification / webhook.
-      if (!process.env.PAYSTACK_SECRET_KEY) {
-        return res.status(400).json({
-          success: false,
-          error: 'Card payments are not enabled yet. Please try again later.',
-        });
-      }
-      status = 'pending';
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(400).json({
+        success: false,
+        error: 'Card payments are not enabled yet. Please try again later.',
+      });
     }
+
+    // A mentorship request never starts as 'paid'. It becomes 'paid' only after
+    // server-side transaction verification / webhook confirms the Paystack charge.
+    let status: 'pending' | 'paid' | 'failed' = 'pending';
 
     // Guard against forged amounts: a mentorship request must match the
     // configured package price (or be recorded as failed).

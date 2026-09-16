@@ -37,7 +37,7 @@ const MentorshipSchema: Schema = new Schema(
     mentorName: { type: String },
     amount: { type: Number, required: true, min: 0 },
     currency: { type: String, required: true, default: 'NGN' },
-    provider: { type: String, enum: ['paystack', 'demo'], required: true },
+    provider: { type: String, enum: ['paystack'], required: true },
     reference: { type: String, required: true, unique: true },
     status: { type: String, enum: ['paid', 'pending', 'failed'], default: 'pending' },
     note: { type: String, trim: true },

@@ -126,15 +126,54 @@ export const getMentorDashboard = async (req: Request, res: Response) => {
     }
 
     const myMentees = await Mentorship.find({ mentorId: userId, status: 'paid' }).sort({ createdAt: -1 }).lean();
-    const openRequests = await Mentorship.find({ status: 'paid', mentorId: null }).sort({ createdAt: -1 }).lean();
+    // Least privilege (S7): the open-requests pool is visible to every approved
+    // mentor, so the DB projection NEVER selects PII — userEmail and reference
+    // (and any other payment/user fields) are not fetched at all, not merely
+    // omitted from the JSON response. Only non-PII transaction metrics needed
+    // for mentoring assignments are exposed.
+    const openRequests = await Mentorship.find(
+      { status: 'paid', mentorId: null },
+      {
+        _id: 1,
+        opportunityId: 1,
+        opportunityTitle: 1,
+        opportunityOrg: 1,
+        opportunityType: 1,
+        opportunityCategory: 1,
+        userName: 1,
+        amount: 1,
+        currency: 1,
+        note: 1,
+        createdAt: 1,
+      }
+    )
+      .sort({ createdAt: -1 })
+      .lean();
 
     const totalPaid = myMentees.reduce((sum, m) => sum + (m.amount || 0), 0);
+
+    // Strip PII from the open-requests pool: those listings are visible to
+    // every approved mentor (not yet assigned), so no email or payment
+    // reference may be exposed. Mentor assignment happens by opportunity.
+    const redactOpenRequest = (r: any) => ({
+      _id: r._id,
+      opportunityId: r.opportunityId || null,
+      opportunityTitle: r.opportunityTitle || '',
+      opportunityOrg: r.opportunityOrg || '',
+      opportunityType: r.opportunityType || '',
+      opportunityCategory: r.opportunityCategory || '',
+      userName: r.userName ? `${r.userName.charAt(0)}***` : '',
+      amount: r.amount || 0,
+      currency: r.currency || 'NGN',
+      note: r.note || '',
+      createdAt: r.createdAt,
+    });
 
     res.json({
       success: true,
       mentor,
       myMentees,
-      openRequests,
+      openRequests: openRequests.map(redactOpenRequest),
       totalMentees: myMentees.length,
       totalEarned: totalPaid * MENTOR_CUT,
     });
