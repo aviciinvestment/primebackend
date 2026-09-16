@@ -53,9 +53,103 @@ const feedCacheSet = (key: string, payload: unknown): void => {
 };
 
 // Called by the opportunity sync after it commits new/updated/closed listings
-// so the public feed reflects the change right away (not after the 60s TTL).
+// so the public feed reflects the change right away (not after the 120s TTL).
 export const invalidateOpportunityFeedCache = (): void => {
   feedCache.clear();
+};
+
+// ---------------------------------------------------------------------------
+// Feed cursor — keyset pagination (replaces O(n) $skip for deep scrolling).
+//
+// The cursor is an opaque base64url payload holding the last-seen sort-bound
+// tuple {status, priorityScore, dateDiscovered, _id}. Requests pass it back as
+// ?after=<cursor>; the next page then seeks DIRECTLY past that boundary with
+// $gt/$lt on the same index keys the sort uses, so cost stays flat no matter
+// how deep the user scrolls. Decoding is strict and fails closed: a malformed
+// cursor simply means "start from the beginning again" (no 4xx, no throw).
+// ---------------------------------------------------------------------------
+
+interface FeedCursor {
+  status: string;
+  priorityScore: number;
+  dateDiscovered: string;
+  _id: string;
+}
+
+// The exact field tuple (in sort order) we may keyset-seek on. Each entry maps
+// a Mongo field to its sort direction. 'best' and 'newest' are cursor-capable;
+// 'deadline'/'text' keep the (clamped, index-backed, cached) skip fallback
+// because nullable deadlines and relevance scores do not keyset cleanly.
+const SORT_KEY_SET = {
+  best: [
+    { field: 'priorityScore', dir: -1 as const },
+    { field: 'dateDiscovered', dir: -1 as const },
+    { field: '_id', dir: 1 as const },
+  ],
+  newest: [
+    { field: 'dateDiscovered', dir: -1 as const },
+    { field: '_id', dir: 1 as const },
+  ],
+} as const;
+
+const feedSortVariantOf = (req: Request): 'best' | 'newest' | 'deadline' | 'text' => {
+  if (req.query.search) return 'text';
+  if (req.query.sort === 'newest') return 'newest';
+  if (req.query.sort === 'deadline') return 'deadline';
+  return 'best';
+};
+
+const encodeFeedCursor = (doc: {
+  status: string;
+  priorityScore: number;
+  dateDiscovered?: Date | string;
+  _id: unknown;
+}): string => {
+  const payload: FeedCursor = {
+    status: doc.status || 'DEADLINE UNKNOWN',
+    priorityScore: typeof doc.priorityScore === 'number' ? doc.priorityScore : 0,
+    dateDiscovered:
+      doc.dateDiscovered instanceof Date
+        ? doc.dateDiscovered.toISOString()
+        : String(doc.dateDiscovered ?? ''),
+    _id: String(doc._id),
+  };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+};
+
+const decodeFeedCursor = (raw: string): FeedCursor | null => {
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.status !== 'string' || parsed.status.length === 0) return null;
+    if (typeof parsed.priorityScore !== 'number' || !Number.isFinite(parsed.priorityScore)) return null;
+    if (typeof parsed._id !== 'string' || !/^[0-9a-fA-F]{24}$/.test(parsed._id)) return null;
+    if (typeof parsed.dateDiscovered !== 'string' || Number.isNaN(new Date(parsed.dateDiscovered).getTime())) return null;
+    return {
+      status: parsed.status,
+      priorityScore: parsed.priorityScore,
+      dateDiscovered: parsed.dateDiscovered,
+      _id: parsed._id,
+    };
+  } catch {
+    return null; // malformed / truncated / tampered cursor → feed from page 1
+  }
+};
+
+// Builds the $or seek predicate for a keyset: (k1 > b1) OR (k1 = b1 AND k2 > b2)
+// OR (k1 = b1 AND k2 = b2 AND k3 > b3)... — the standard efficient resume.
+const buildSeekFilter = (
+  cursor: FeedCursor,
+  keys: readonly { field: 'priorityScore' | 'dateDiscovered' | '_id'; dir: -1 | 1 }[]
+): Record<string, unknown> => {
+  const prefix: Record<string, unknown> = {};
+  const or: Record<string, unknown>[] = [];
+  for (const { field, dir } of keys) {
+    const bound = field === '_id' ? cursor._id : field === 'priorityScore' ? cursor.priorityScore : cursor.dateDiscovered;
+    or.push({ ...prefix, [field]: { [dir === 1 ? '$gt' : '$lt']: bound } });
+    prefix[field] = bound;
+  }
+  return { $or: or };
 };
 
 // ---------------------------------------------------------------------------
@@ -124,7 +218,7 @@ export const getOpportunities = async (req: Request, res: Response) => {
   const cacheKey = feedCacheKey(req);
   const cached = feedCacheGet(cacheKey);
   if (cached !== null) {
-    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.setHeader('Cache-Control', 'public, max-age=120');
     return res.json(cached);
   }
 
@@ -137,7 +231,6 @@ export const getOpportunities = async (req: Request, res: Response) => {
     const rawLimit = parseInt(req.query.limit as string);
     const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.min(rawPage, MAX_PAGE) : 1;
     const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, MAX_LIMIT) : 10;
-    const skip = (page - 1) * limit;
 
     // Build filter query based on query params
     const filter: any = {};
@@ -208,7 +301,7 @@ export const getOpportunities = async (req: Request, res: Response) => {
           semantic: true,
         };
         feedCacheSet(cacheKey, payload);
-        res.setHeader('Cache-Control', 'public, max-age=60');
+        res.setHeader('Cache-Control', 'public, max-age=120');
         res.json(payload);
         return;
       } catch (error: any) {
@@ -219,21 +312,71 @@ export const getOpportunities = async (req: Request, res: Response) => {
       }
     }
 
-    let sortQuery: any = { priorityScore: -1, dateDiscovered: -1 };
-    if (filter.$text) {
+    const sortVariant = feedSortVariantOf(req);
+
+    let sortQuery: any = { priorityScore: -1, dateDiscovered: -1, _id: 1 };
+    if (sortVariant === 'text') {
       sortQuery = { score: { $meta: 'textScore' } };
-    } else if (req.query.sort === 'newest') {
-      sortQuery = { dateDiscovered: -1 };
-    } else if (req.query.sort === 'deadline') {
+    } else if (sortVariant === 'newest') {
+      sortQuery = { dateDiscovered: -1, _id: 1 };
+    } else if (sortVariant === 'deadline') {
       sortQuery = { deadline: 1, dateDiscovered: -1 };
     }
 
+    const cursorCapable = sortVariant === 'best' || sortVariant === 'newest';
+    const rawAfter = req.query.after as string | undefined;
+    const cursor = cursorCapable && rawAfter ? decodeFeedCursor(rawAfter) : null;
+
+    if (cursor) {
+      // Keyset seek: land straight past the last-seen page boundary using the
+      // index, so a deep scroll costs the same as page 1 (no $skip, no count).
+      filter.$and = [buildSeekFilter(cursor, SORT_KEY_SET[sortVariant as 'best' | 'newest'])];
+    }
+
+    const hasMore = (found: typeof opportunities, rows: typeof opportunities) => found.length > rows.length;
+    const nextCursorFrom = (rows: typeof opportunities) =>
+      rows.length > 0 ? encodeFeedCursor(rows[rows.length - 1]) : undefined;
+
+    if (cursor) {
+      // Cursor page: fetch one extra row to detect a following page without a
+      // full countDocuments pass — the key win that keeps latency flat.
+      const found = await Opportunity.find(filter)
+        .sort(sortQuery)
+        .limit(limit + 1);
+      const opportunities = found.slice(0, limit);
+      const nextCursor =
+        found.length > opportunities.length && opportunities.length > 0
+          ? encodeFeedCursor(opportunities[opportunities.length - 1])
+          : undefined;
+
+      const payload = {
+        success: true,
+        count: opportunities.length,
+        limit,
+        nextCursor,
+        data: opportunities,
+        semantic: false,
+      };
+      feedCacheSet(cacheKey, payload);
+      res.setHeader('Cache-Control', 'public, max-age=120');
+      res.json(payload);
+      return;
+    }
+
+    // Legacy page/limit path (still clamped + index-backed + cached). Also
+    // returns nextCursor when more rows exist so cursor-capable clients can
+    // seamlessly switch over on the very next fetch.
+    const skip = (page - 1) * limit;
     const opportunities = await Opportunity.find(filter)
       .sort(sortQuery)
       .skip(skip)
       .limit(limit);
 
     const total = await Opportunity.countDocuments(filter);
+    const nextCursor =
+      page < Math.ceil(total / limit) && opportunities.length > 0
+        ? encodeFeedCursor(opportunities[opportunities.length - 1])
+        : undefined;
 
     const payload = {
       success: true,
@@ -241,11 +384,12 @@ export const getOpportunities = async (req: Request, res: Response) => {
       total,
       page,
       pages: Math.ceil(total / limit),
+      nextCursor,
       data: opportunities,
       semantic: false,
     };
     feedCacheSet(cacheKey, payload);
-    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.setHeader('Cache-Control', 'public, max-age=120');
     res.json(payload);
   } catch (error: any) {
     console.error('Error fetching opportunities:', error);

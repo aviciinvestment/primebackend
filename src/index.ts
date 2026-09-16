@@ -74,6 +74,26 @@ import userRoutes from './routes/userRoutes';
 import adminRoutes from './routes/adminRoutes';
 import launchRoutes from './routes/launchRoutes';
 
+// Load-balancer health probe (Tier 1, Item 1). The LB checks GET /healthz and
+// marks the instance ready only when BOTH hold: this handler is executing (the
+// Express event loop is live) AND Mongo reports readyState === 1 (Connected).
+// Any other Mongo state (0 disconnected, 2 connecting, 3 disconnecting) returns
+// 503 so the LB drains the box instead of routing traffic to one that can't
+// reach the data layer. Deliberately constant-time — no DB round-trip on the
+// heartbeat path. Outside /api, so heartbeat probes never burn rate-limit
+// budget either.
+export const healthHandler: express.RequestHandler = (_req, res) => {
+  const dbReady = mongoose.connection.readyState === 1;
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(dbReady ? 200 : 503).json({
+    status: dbReady ? 'ok' : 'degraded',
+    db: mongoose.connection.readyState,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+};
+app.get('/healthz', healthHandler);
+
 // Basic health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Opportunity Radar API is running' });
@@ -110,13 +130,34 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   return res.status(500).json({ success: false, error: 'Internal server error.' });
 });
 
-// Database connection
+// ---------------------------------------------------------------------------
+// Boot pipeline (Tier 1, Item 1): the listener opens ONLY after Mongo is
+// confirmed connected, so the app never accepts web traffic before the data
+// layer is reachable. Unreachable Mongo is retried up to MONGO_RETRY_ATTEMPTS,
+// then the process exits non-zero — Render/LB restarts the instance instead of
+// letting a DB-less box 500 on every route. /healthz keeps the LB honest during
+// operation: a post-boot Mongo drop flips it to 503 and the LB drains us.
+// ---------------------------------------------------------------------------
 const mongoUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/opportunity-radar';
+const MONGO_CONNECT_RETRIES = Math.min(Math.max(parseInt(process.env.MONGO_RETRY_ATTEMPTS || '10', 10), 1), 30);
+const MONGO_RETRY_DELAY_MS = Math.min(Math.max(parseInt(process.env.MONGO_RETRY_MS || '3000', 10), 250), 30000);
 
-// Start server immediately
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function waitForDatabase(): Promise<void> {
+  for (let attempt = 1; attempt <= MONGO_CONNECT_RETRIES; attempt++) {
+    try {
+      await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 });
+      return;
+    } catch (error: any) {
+      console.error(
+        `MongoDB connection attempt ${attempt}/${MONGO_CONNECT_RETRIES} failed: ${error?.message || error}`
+      );
+      if (attempt === MONGO_CONNECT_RETRIES) throw error;
+      await delay(MONGO_RETRY_DELAY_MS);
+    }
+  }
+}
 
 // Daily opportunity sync: run once on boot, then on a cron schedule.
 // Pulls fresh listings from external APIs/RSS, closes expired deadlines, and
@@ -159,18 +200,24 @@ const scheduleLaunchCheck = () => {
   });
 };
 
-mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 })
-  .then(() => {
-    console.log('Connected to MongoDB');
-    scheduleOpportunitySync();
-    scheduleLaunchCheck();
-  })
-  .catch((error) => {
-    console.error('MongoDB connection error. Running in mock mode.', error.message);
-    console.log('Opportunity sync requires MongoDB — it will start once the database reconnects.');
-    // Retry connecting + scheduling when the DB becomes available.
-    mongoose.connection.on('connected', () => {
-      scheduleOpportunitySync();
-      scheduleLaunchCheck();
-    });
+async function main() {
+  if (process.env.PRIME_BOOT === '0') return; // test harness: import routes without booting
+
+  await waitForDatabase();
+  console.log('Connected to MongoDB');
+
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
   });
+
+  scheduleOpportunitySync();
+  scheduleLaunchCheck();
+}
+
+main().catch((error) => {
+  console.error(
+    'Fatal: MongoDB unreachable — refusing to accept traffic. Exiting.',
+    error?.message || error
+  );
+  process.exit(1);
+});

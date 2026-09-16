@@ -5,6 +5,10 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
     for (let key of __getOwnPropNames(from))
@@ -21,8 +25,14 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
   mod
 ));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // src/index.ts
+var index_exports = {};
+__export(index_exports, {
+  healthHandler: () => healthHandler
+});
+module.exports = __toCommonJS(index_exports);
 var import_config = require("dotenv/config");
 var import_express18 = __toESM(require("express"));
 var import_compression = __toESM(require("compression"));
@@ -240,6 +250,60 @@ var feedCacheSet = (key, payload) => {
 var invalidateOpportunityFeedCache = () => {
   feedCache.clear();
 };
+var SORT_KEY_SET = {
+  best: [
+    { field: "priorityScore", dir: -1 },
+    { field: "dateDiscovered", dir: -1 },
+    { field: "_id", dir: 1 }
+  ],
+  newest: [
+    { field: "dateDiscovered", dir: -1 },
+    { field: "_id", dir: 1 }
+  ]
+};
+var feedSortVariantOf = (req) => {
+  if (req.query.search) return "text";
+  if (req.query.sort === "newest") return "newest";
+  if (req.query.sort === "deadline") return "deadline";
+  return "best";
+};
+var encodeFeedCursor = (doc) => {
+  const payload = {
+    status: doc.status || "DEADLINE UNKNOWN",
+    priorityScore: typeof doc.priorityScore === "number" ? doc.priorityScore : 0,
+    dateDiscovered: doc.dateDiscovered instanceof Date ? doc.dateDiscovered.toISOString() : String(doc.dateDiscovered ?? ""),
+    _id: String(doc._id)
+  };
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+};
+var decodeFeedCursor = (raw) => {
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.status !== "string" || parsed.status.length === 0) return null;
+    if (typeof parsed.priorityScore !== "number" || !Number.isFinite(parsed.priorityScore)) return null;
+    if (typeof parsed._id !== "string" || !/^[0-9a-fA-F]{24}$/.test(parsed._id)) return null;
+    if (typeof parsed.dateDiscovered !== "string" || Number.isNaN(new Date(parsed.dateDiscovered).getTime())) return null;
+    return {
+      status: parsed.status,
+      priorityScore: parsed.priorityScore,
+      dateDiscovered: parsed.dateDiscovered,
+      _id: parsed._id
+    };
+  } catch {
+    return null;
+  }
+};
+var buildSeekFilter = (cursor, keys) => {
+  const prefix = {};
+  const or = [];
+  for (const { field, dir } of keys) {
+    const bound = field === "_id" ? cursor._id : field === "priorityScore" ? cursor.priorityScore : cursor.dateDiscovered;
+    or.push({ ...prefix, [field]: { [dir === 1 ? "$gt" : "$lt"]: bound } });
+    prefix[field] = bound;
+  }
+  return { $or: or };
+};
 var tokenize = (text) => new Set(
   text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t.length > 1)
 );
@@ -261,7 +325,7 @@ var getOpportunities = async (req, res) => {
   const cacheKey = feedCacheKey(req);
   const cached = feedCacheGet(cacheKey);
   if (cached !== null) {
-    res.setHeader("Cache-Control", "public, max-age=60");
+    res.setHeader("Cache-Control", "public, max-age=120");
     return res.json(cached);
   }
   try {
@@ -271,7 +335,6 @@ var getOpportunities = async (req, res) => {
     const rawLimit = parseInt(req.query.limit);
     const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.min(rawPage, MAX_PAGE) : 1;
     const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, MAX_LIMIT) : 10;
-    const skip = (page - 1) * limit;
     const filter = {};
     if (!req.query.status) {
       filter.status = { $in: ["OPEN", "CLOSING SOON", "UPCOMING", "DEADLINE UNKNOWN"] };
@@ -312,7 +375,7 @@ var getOpportunities = async (req, res) => {
           semantic: true
         };
         feedCacheSet(cacheKey, payload2);
-        res.setHeader("Cache-Control", "public, max-age=60");
+        res.setHeader("Cache-Control", "public, max-age=120");
         res.json(payload2);
         return;
       } catch (error) {
@@ -320,27 +383,56 @@ var getOpportunities = async (req, res) => {
         filter.$text = { $search: searchText };
       }
     }
-    let sortQuery = { priorityScore: -1, dateDiscovered: -1 };
-    if (filter.$text) {
+    const sortVariant = feedSortVariantOf(req);
+    let sortQuery = { priorityScore: -1, dateDiscovered: -1, _id: 1 };
+    if (sortVariant === "text") {
       sortQuery = { score: { $meta: "textScore" } };
-    } else if (req.query.sort === "newest") {
-      sortQuery = { dateDiscovered: -1 };
-    } else if (req.query.sort === "deadline") {
+    } else if (sortVariant === "newest") {
+      sortQuery = { dateDiscovered: -1, _id: 1 };
+    } else if (sortVariant === "deadline") {
       sortQuery = { deadline: 1, dateDiscovered: -1 };
     }
+    const cursorCapable = sortVariant === "best" || sortVariant === "newest";
+    const rawAfter = req.query.after;
+    const cursor = cursorCapable && rawAfter ? decodeFeedCursor(rawAfter) : null;
+    if (cursor) {
+      filter.$and = [buildSeekFilter(cursor, SORT_KEY_SET[sortVariant])];
+    }
+    const hasMore = (found, rows) => found.length > rows.length;
+    const nextCursorFrom = (rows) => rows.length > 0 ? encodeFeedCursor(rows[rows.length - 1]) : void 0;
+    if (cursor) {
+      const found = await Opportunity_default.find(filter).sort(sortQuery).limit(limit + 1);
+      const opportunities2 = found.slice(0, limit);
+      const nextCursor2 = found.length > opportunities2.length && opportunities2.length > 0 ? encodeFeedCursor(opportunities2[opportunities2.length - 1]) : void 0;
+      const payload2 = {
+        success: true,
+        count: opportunities2.length,
+        limit,
+        nextCursor: nextCursor2,
+        data: opportunities2,
+        semantic: false
+      };
+      feedCacheSet(cacheKey, payload2);
+      res.setHeader("Cache-Control", "public, max-age=120");
+      res.json(payload2);
+      return;
+    }
+    const skip = (page - 1) * limit;
     const opportunities = await Opportunity_default.find(filter).sort(sortQuery).skip(skip).limit(limit);
     const total = await Opportunity_default.countDocuments(filter);
+    const nextCursor = page < Math.ceil(total / limit) && opportunities.length > 0 ? encodeFeedCursor(opportunities[opportunities.length - 1]) : void 0;
     const payload = {
       success: true,
       count: opportunities.length,
       total,
       page,
       pages: Math.ceil(total / limit),
+      nextCursor,
       data: opportunities,
       semantic: false
     };
     feedCacheSet(cacheKey, payload);
-    res.setHeader("Cache-Control", "public, max-age=60");
+    res.setHeader("Cache-Control", "public, max-age=120");
     res.json(payload);
   } catch (error) {
     console.error("Error fetching opportunities:", error);
@@ -1274,7 +1366,7 @@ var MongoStore = class {
 var errorJson = (req, res) => {
   res.status(429).json({ success: false, error: "Too many requests. Please try again shortly." });
 };
-var sharedStore = new MongoStore();
+var newMongoStore = () => new MongoStore();
 var windowMs = 60 * 1e3;
 var makeOptions = (name, limit, opts = {}) => ({
   windowMs,
@@ -1284,17 +1376,19 @@ var makeOptions = (name, limit, opts = {}) => ({
   legacyHeaders: false,
   // Disable the `X-RateLimit-*` headers
   handler: errorJson,
-  // req.ip is set by 'trust proxy' from the proxy chain; prefix it so each
-  // limiter owns a disjoint key space in the shared Mongo collection.
-  keyGenerator: (req) => `${name}:${req.ip || req.socket.remoteAddress || "unknown"}`,
+  // req.ip is set by 'trust proxy' from the proxy chain; ipKeyGenerator
+  // normalizes IPv6 -> /56 subnet so limit keys don't collide per-address when
+  // the proxy forwards IPv6 clients. Prefix it so each limiter owns a disjoint
+  // key space in the shared Mongo collection.
+  keyGenerator: (req) => `${name}:${(0, import_express_rate_limit.ipKeyGenerator)(req.ip || req.socket.remoteAddress || "unknown")}`,
   ...opts
 });
 var apiLimiter = (0, import_express_rate_limit.default)(
-  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("api", 120, { store: sharedStore }) : makeOptions("api", 120)
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("api", 120, { store: newMongoStore() }) : makeOptions("api", 120)
 );
-var strictLimiter = (0, import_express_rate_limit.default)(makeOptions("strict", 20, { store: sharedStore }));
-var sensitiveLimiter = (0, import_express_rate_limit.default)(makeOptions("sensitive", 5, { store: sharedStore }));
-var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(makeOptions("cv", 5, { store: sharedStore }));
+var strictLimiter = (0, import_express_rate_limit.default)(makeOptions("strict", 20, { store: newMongoStore() }));
+var sensitiveLimiter = (0, import_express_rate_limit.default)(makeOptions("sensitive", 5, { store: newMongoStore() }));
+var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(makeOptions("cv", 5, { store: newMongoStore() }));
 
 // src/lib/withLock.ts
 var import_mongoose5 = __toESM(require("mongoose"));
@@ -1338,9 +1432,139 @@ var withLock = async (name, ttlMs, fn) => {
 
 // src/routes/opportunityRoutes.ts
 var import_express3 = __toESM(require("express"));
+
+// src/controllers/socialPreviewController.ts
+var FRONTEND_URL = (process.env.FRONTEND_URL || "https://prime-ed.vercel.app").replace(/\/+$/, "");
+var BRAND_OG_IMAGE = `${FRONTEND_URL}/student_cutout_v2.webp`;
+var escapeHtml = (value) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+var truncate = (text, max) => {
+  const trimmed = (text || "").trim().replace(/\s+/g, " ");
+  if (trimmed.length <= max) return trimmed;
+  return `${trimmed.slice(0, max - 1).trimEnd()}\u2026`;
+};
+var cleanLevel = (level) => level.replace(/^Category\s+[A-Z]\s*[-–—]?\s*/i, "").replace(/\s*[-–—]\s*.*$/i, "").trim() || level.trim();
+var joinList = (items, limit = 3, clean) => {
+  if (!items || items.length === 0) return "";
+  const kept = items.slice(0, limit).map((item) => clean ? clean(item) : item.trim()).filter(Boolean);
+  const suffix = items.length > limit ? ` & ${items.length - limit} more` : "";
+  return `${kept.join(", ")}${suffix}`;
+};
+var formatDeadline = (deadline) => {
+  if (!deadline) return "";
+  const date = new Date(deadline);
+  if (isNaN(date.getTime())) return deadline;
+  return date.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+};
+var buildDescription = (opp) => {
+  const parts = [];
+  if (opp.eligibleEducationLevels?.length) {
+    parts.push(`Open to ${joinList(opp.eligibleEducationLevels, 3, cleanLevel)}`);
+  }
+  if (opp.eligibleFields?.length) {
+    parts.push(`Fields: ${joinList(opp.eligibleFields, 3)}`);
+  }
+  if (opp.deadline) {
+    parts.push(`Apply by ${formatDeadline(opp.deadline)}`);
+  }
+  if (opp.fundingAmount) {
+    parts.push(`Funding: ${opp.fundingAmount}${opp.currency ? ` ${opp.currency}` : ""}`);
+  }
+  const sentence = parts.join(". ");
+  if (sentence.length > 2) return truncate(`${sentence}.`, 200);
+  return truncate(opp.description || "A new opportunity added on Prime Opportunity.", 200);
+};
+var buildShareHtml = (opts) => {
+  const { appLink, ogTitle, ogDescription, ogImage, status } = opts;
+  const o = (value) => escapeHtml(value);
+  const statusBadge = status ? `<meta property="og:status" content="${o(status)}">` : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${o(ogTitle)}</title>
+<meta name="description" content="${o(ogDescription)}">
+<meta name="robots" content="noindex,follow">
+<link rel="canonical" href="${o(appLink)}">
+<meta http-equiv="refresh" content="0; url=${o(appLink)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${o(appLink)}">
+<meta property="og:title" content="${o(ogTitle)}">
+<meta property="og:description" content="${o(ogDescription)}">
+<meta property="og:image" content="${o(ogImage)}">
+<meta property="og:site_name" content="Prime Opportunity">
+${statusBadge}
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${o(ogTitle)}">
+<meta name="twitter:description" content="${o(ogDescription)}">
+<meta name="twitter:image" content="${o(ogImage)}">
+<meta name="theme-color" content="#0a0f16">
+</head>
+<body>
+<p>Opening <a href="${o(appLink)}">${o(ogTitle)}</a>\u2026</p>
+</body>
+</html>
+`;
+};
+var buildNotFoundHtml = () => {
+  const appRoot = FRONTEND_URL;
+  const ogTitle = "Opportunity Not Found";
+  const ogDescription = "This opportunity is no longer available on Prime Opportunity.";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${ogTitle}</title>
+<meta name="description" content="${ogDescription}">
+<meta name="robots" content="noindex,follow">
+<meta http-equiv="refresh" content="0; url=${escapeHtml(appRoot)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${escapeHtml(appRoot)}">
+<meta property="og:title" content="${ogTitle}">
+<meta property="og:description" content="${ogDescription}">
+<meta property="og:site_name" content="Prime Opportunity">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${ogTitle}">
+<meta name="twitter:description" content="${ogDescription}">
+<meta name="theme-color" content="#0a0f16">
+</head>
+<body>
+<p><a href="${escapeHtml(appRoot)}">Back to Prime Opportunity</a></p>
+</body>
+</html>
+`;
+};
+var getSharePreview = async (req, res) => {
+  const id = req.params.id || (typeof req.query.id === "string" ? req.query.id : "");
+  if (!/^[a-f0-9]{24}$/i.test(id)) {
+    res.status(404).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildNotFoundHtml());
+    return;
+  }
+  let opp = null;
+  try {
+    opp = await Opportunity_default.findById(id).select(
+      "title organization organizationLogo description eligibleEducationLevels eligibleFields deadline fundingAmount currency status"
+    ).lean();
+  } catch {
+    opp = null;
+  }
+  if (!opp) {
+    res.status(404).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildNotFoundHtml());
+    return;
+  }
+  const appLink = `${FRONTEND_URL}/opportunities?id=${id}`;
+  const ogTitle = truncate(`${opp.title || "Opportunity"}${opp.organization ? ` \xB7 ${opp.organization}` : ""}`, 70);
+  const ogDescription = buildDescription(opp);
+  const ogImage = opp.organizationLogo && /^https?:\/\//i.test(opp.organizationLogo) ? opp.organizationLogo : BRAND_OG_IMAGE;
+  res.status(200).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildShareHtml({ appLink, ogTitle, ogDescription, ogImage, status: opp.status }));
+};
+
+// src/routes/opportunityRoutes.ts
 var router = import_express3.default.Router();
 router.get("/", getOpportunities);
+router.get("/share", getSharePreview);
 router.get("/:id", getOpportunity);
+router.get("/:id/share", getSharePreview);
 var opportunityRoutes_default = router;
 
 // src/routes/aiRoutes.ts
@@ -1585,6 +1809,30 @@ var nvidiaChatClient = new import_openai2.default({
   timeout: 9e4,
   maxRetries: 1
 });
+var CHAT_RATE_LIMIT = { CEILING: 3, WINDOW_MS: 6e4 };
+var chatBuckets = /* @__PURE__ */ new Map();
+var chatRateLimitCheck = (uid) => {
+  const now = Date.now();
+  const entry = chatBuckets.get(uid);
+  if (!entry) {
+    chatBuckets.set(uid, { tokens: CHAT_RATE_LIMIT.CEILING - 1, last: now });
+    return true;
+  }
+  const refill = (now - entry.last) / CHAT_RATE_LIMIT.WINDOW_MS * CHAT_RATE_LIMIT.CEILING;
+  entry.tokens = Math.min(CHAT_RATE_LIMIT.CEILING, entry.tokens + refill);
+  entry.last = now;
+  if (entry.tokens < 1) return false;
+  entry.tokens -= 1;
+  return true;
+};
+var CHAT_RATE_SWEEP_MS = 6e4;
+var sweepChatBuckets = () => {
+  const cutoff = Date.now() - 2 * CHAT_RATE_LIMIT.WINDOW_MS;
+  for (const [uid, entry] of chatBuckets) {
+    if (entry.last < cutoff) chatBuckets.delete(uid);
+  }
+};
+setInterval(sweepChatBuckets, CHAT_RATE_SWEEP_MS).unref();
 var CV_NAMESPACE_PREFIX = "cvs-";
 var embedText = async (text) => {
   const key = (0, import_crypto.createHash)("sha256").update(text).digest("hex");
@@ -1802,6 +2050,11 @@ var chatWithAI = async (req, res) => {
     const userEmail = (req.authUser.email || "").trim();
     const userName = (req.body?.userName || "").trim();
     const stream = req.body?.stream === true;
+    if (!chatRateLimitCheck(userId)) {
+      res.setHeader("Retry-After", String(Math.ceil(CHAT_RATE_LIMIT.WINDOW_MS / 1e3)));
+      res.status(429).json({ success: false, message: "You are sending messages too quickly. Please slow down and try again in a moment." });
+      return;
+    }
     const startSse = () => {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -3058,6 +3311,17 @@ app2.use(import_express18.default.json({ limit: "1mb" }));
 app2.use("/api", apiLimiter);
 app2.use("/api/ai/chat", strictLimiter);
 app2.use("/api/sync", sensitiveLimiter);
+var healthHandler = (_req, res) => {
+  const dbReady = import_mongoose14.default.connection.readyState === 1;
+  res.setHeader("Cache-Control", "no-store");
+  res.status(dbReady ? 200 : 503).json({
+    status: dbReady ? "ok" : "degraded",
+    db: import_mongoose14.default.connection.readyState,
+    uptime: process.uptime(),
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  });
+};
+app2.get("/healthz", healthHandler);
 app2.get("/api/health", (req, res) => {
   res.json({ status: "ok", message: "Opportunity Radar API is running" });
 });
@@ -3086,9 +3350,23 @@ app2.use((err, _req, res, _next) => {
   return res.status(500).json({ success: false, error: "Internal server error." });
 });
 var mongoUri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/opportunity-radar";
-app2.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+var MONGO_CONNECT_RETRIES = Math.min(Math.max(parseInt(process.env.MONGO_RETRY_ATTEMPTS || "10", 10), 1), 30);
+var MONGO_RETRY_DELAY_MS = Math.min(Math.max(parseInt(process.env.MONGO_RETRY_MS || "3000", 10), 250), 3e4);
+var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitForDatabase() {
+  for (let attempt = 1; attempt <= MONGO_CONNECT_RETRIES; attempt++) {
+    try {
+      await import_mongoose14.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
+      return;
+    } catch (error) {
+      console.error(
+        `MongoDB connection attempt ${attempt}/${MONGO_CONNECT_RETRIES} failed: ${error?.message || error}`
+      );
+      if (attempt === MONGO_CONNECT_RETRIES) throw error;
+      await delay(MONGO_RETRY_DELAY_MS);
+    }
+  }
+}
 var scheduleOpportunitySync = () => {
   const cronExpression = process.env.SYNC_CRON || "0 6 * * *";
   const timezone = process.env.SYNC_TIMEZONE || "Africa/Lagos";
@@ -3117,15 +3395,24 @@ var scheduleLaunchCheck = () => {
     }
   });
 };
-import_mongoose14.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 }).then(() => {
+async function main() {
+  if (process.env.PRIME_BOOT === "0") return;
+  await waitForDatabase();
   console.log("Connected to MongoDB");
+  app2.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
   scheduleOpportunitySync();
   scheduleLaunchCheck();
-}).catch((error) => {
-  console.error("MongoDB connection error. Running in mock mode.", error.message);
-  console.log("Opportunity sync requires MongoDB \u2014 it will start once the database reconnects.");
-  import_mongoose14.default.connection.on("connected", () => {
-    scheduleOpportunitySync();
-    scheduleLaunchCheck();
-  });
+}
+main().catch((error) => {
+  console.error(
+    "Fatal: MongoDB unreachable \u2014 refusing to accept traffic. Exiting.",
+    error?.message || error
+  );
+  process.exit(1);
+});
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  healthHandler
 });

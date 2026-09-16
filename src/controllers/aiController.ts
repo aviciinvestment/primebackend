@@ -36,6 +36,56 @@ const nvidiaChatClient = new OpenAI({
   maxRetries: 1,
 });
 
+// ---- Per-user chat burst limiter (Tier 2, Item 6) --------------------------
+// The chat endpoint calls the SHARED NVIDIA API layer, so a single user spamming
+// messages could burn the shared key's quota for everyone. Burst control is
+// keyed on the VERIFIED Firebase uid (req.authUser!.uid), never the raw client
+// IP — one home/office/ISP NAT IP can carry dozens of real users, so IP-based
+// limits collide with legitimate shared traffic. Exactly what a uid bucket costs:
+// one Map look-up + one timestamp compare per request — far below any baseline.
+//
+// Token bucket per uid: CEILING tokens refilled continuously (CEILING per
+// WINDOW_MS), so short bursts are allowed but sustained load is smoothed.
+const CHAT_RATE_LIMIT = { CEILING: 3, WINDOW_MS: 60_000 };
+const chatBuckets = new Map<string, { tokens: number; last: number }>();
+
+const chatRateLimitCheck = (uid: string): boolean => {
+  const now = Date.now();
+  const entry = chatBuckets.get(uid);
+  if (!entry) {
+    chatBuckets.set(uid, { tokens: CHAT_RATE_LIMIT.CEILING - 1, last: now });
+    return true;
+  }
+  const refill =
+    ((now - entry.last) / CHAT_RATE_LIMIT.WINDOW_MS) * CHAT_RATE_LIMIT.CEILING;
+  entry.tokens = Math.min(CHAT_RATE_LIMIT.CEILING, entry.tokens + refill);
+  entry.last = now;
+  if (entry.tokens < 1) return false;
+  entry.tokens -= 1;
+  return true;
+};
+
+// Automated sweep: drop any bucket idle for 2+ windows so the map only ever
+// holds recently-active users — zero risk of unbounded memory growth. unref'd
+// so the interval never keeps the Node process alive on its own.
+const CHAT_RATE_SWEEP_MS = 60_000;
+const sweepChatBuckets = (): void => {
+  const cutoff = Date.now() - 2 * CHAT_RATE_LIMIT.WINDOW_MS;
+  for (const [uid, entry] of chatBuckets) {
+    if (entry.last < cutoff) chatBuckets.delete(uid);
+  }
+};
+setInterval(sweepChatBuckets, CHAT_RATE_SWEEP_MS).unref();
+
+// Exported for tests so the module-level map can be inspected/reset deterministically.
+export const _chatRateLimit = {
+  buckets: chatBuckets,
+  check: chatRateLimitCheck,
+  sweep: sweepChatBuckets,
+  config: CHAT_RATE_LIMIT,
+  sweepMs: CHAT_RATE_SWEEP_MS,
+};
+
 // Each user's CV vectors live in their OWN namespace (cvs-<userId>).
 // This guarantees a chat query can never retrieve another user's CV data,
 // even if a malicious request is made.
@@ -358,6 +408,16 @@ export const chatWithAI = async (req: Request, res: Response) => {
     const userName = ((req.body?.userName as string) || '').trim();
 
     const stream = req.body?.stream === true;
+
+    // Per-user burst gate (Tier 2, Item 6): keyed on the verified uid, never
+    // the client IP (a shared NAT/ISP IP hosts many real users). Checked here —
+    // before ANY outbound NVIDIA work and before SSE headers are flushed — so
+    // the 429 is always a clean HTTP response in both JSON and stream modes.
+    if (!chatRateLimitCheck(userId)) {
+      res.setHeader('Retry-After', String(Math.ceil(CHAT_RATE_LIMIT.WINDOW_MS / 1000)));
+      res.status(429).json({ success: false, message: 'You are sending messages too quickly. Please slow down and try again in a moment.' });
+      return;
+    }
 
     // --- helpers for the two output modes (JSON vs SSE) ---
     const startSse = () => {
