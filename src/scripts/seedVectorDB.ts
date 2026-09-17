@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import path from 'path';
-import { Pinecone } from '@pinecone-database/pinecone';
+import { Pinecone, type RecordMetadata } from '@pinecone-database/pinecone';
 import OpenAI from 'openai';
 import Opportunity from '../models/Opportunity';
 
@@ -94,17 +94,37 @@ async function seedVectorDB() {
         `.trim();
         
         const embedding = await generateEmbedding(textToEmbed);
-        
+
+        // Denormalized payload: every field the worker's RAG prompt needs rides
+        // in the metadata so chat context is served straight from Pinecone with
+        // no backend round-trip. Must match opportunityVectorService metadata.
+        const eligibleFields = (opp.eligibleFields || []).filter(Boolean);
+        const eligibility = (opp.eligibleEducationLevels || []).filter(Boolean);
+        const targetAudience = (opp.targetAudience || []).filter(Boolean);
+        const metadata: RecordMetadata = {
+          title: opp.title,
+          organization: opp.organization,
+          category: opp.category || '',
+          opportunityType: opp.opportunityType || '',
+          location: opp.location || '',
+          deadline: opp.deadline || '',
+          status: opp.status || '',
+          officialUrl: opp.officialUrl || '',
+          tags: (opp.tags || []).slice(0, 12),
+          description: opp.description || '',
+          org: opp.organization || '',
+          full_description: opp.description || '',
+          eligibility: eligibility.join(', '),
+          link: opp.officialUrl || '',
+        };
+        if (eligibleFields.length > 0) metadata.eligibleFields = eligibleFields;
+        if (eligibility.length > 0) metadata.eligibleEducationLevels = eligibility;
+        if (targetAudience.length > 0) metadata.targetAudience = targetAudience;
+
         vectors.push({
           id: opp._id.toString(),
           values: embedding,
-          metadata: {
-            title: opp.title,
-            organization: opp.organization,
-            category: opp.category || '',
-            opportunityType: opp.opportunityType || '',
-            location: opp.location || ''
-          }
+          metadata,
         });
       }
       

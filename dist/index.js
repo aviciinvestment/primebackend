@@ -156,6 +156,33 @@ var generateEmbedding = async (text) => {
   });
   return response.data[0].embedding;
 };
+var buildOpportunityMetadata = (opp) => {
+  const eligibleFields = (opp.eligibleFields || []).filter(Boolean);
+  const eligibility = (opp.eligibleEducationLevels || []).filter(Boolean);
+  const targetAudience = (opp.targetAudience || []).filter(Boolean);
+  const tags = (opp.tags || []).slice(0, 12);
+  const metadata = {
+    title: opp.title,
+    organization: opp.organization,
+    category: opp.category || "",
+    opportunityType: opp.opportunityType || "",
+    location: opp.location || "",
+    deadline: opp.deadline || "",
+    status: opp.status || "",
+    officialUrl: opp.officialUrl || "",
+    tags,
+    description: opp.description || "",
+    // Direct-extraction aliases used by the worker RAG builder.
+    org: opp.organization || "",
+    full_description: opp.description || "",
+    eligibility: eligibility.join(", "),
+    link: opp.officialUrl || ""
+  };
+  if (eligibleFields.length > 0) metadata.eligibleFields = eligibleFields;
+  if (eligibility.length > 0) metadata.eligibleEducationLevels = eligibility;
+  if (targetAudience.length > 0) metadata.targetAudience = targetAudience;
+  return metadata;
+};
 var upsertOpportunityVector = async (opp) => {
   const index = pinecone.index(INDEX_NAME);
   const embedding = await generateEmbedding(buildOpportunityVectorText(opp));
@@ -163,16 +190,7 @@ var upsertOpportunityVector = async (opp) => {
     {
       id: opp._id.toString(),
       values: embedding,
-      metadata: {
-        title: opp.title,
-        organization: opp.organization,
-        category: opp.category || "",
-        opportunityType: opp.opportunityType || "",
-        location: opp.location || "",
-        deadline: opp.deadline || "",
-        status: opp.status || "",
-        officialUrl: opp.officialUrl || ""
-      }
+      metadata: buildOpportunityMetadata(opp)
     }
   ]);
   await Opportunity_default.updateOne({ _id: opp._id }, { $set: { vectorized: true } });
