@@ -1783,6 +1783,7 @@ var CvSchema = new import_mongoose7.Schema(
     fileData: { type: Buffer },
     cloudinaryId: { type: String },
     cloudinaryUrl: { type: String },
+    vectorTextHash: { type: String },
     text: { type: String },
     analysis: { type: String },
     matchIds: [{ type: import_mongoose7.Schema.Types.ObjectId, ref: "Opportunity" }]
@@ -2070,6 +2071,9 @@ var nvidiaChatClient2 = new import_openai2.default({
   maxRetries: 1
 });
 var LLM_ATTEMPT_TIMEOUT_MS = 3e4;
+var CV_ANALYSIS_MODEL = "meta/muse-glimmer-30b";
+var CV_ANALYSIS_TIMEOUT_MS = 2e4;
+var CV_MAX_TOKENS = 1024;
 var MAX_INFLIGHT_LLM = 5;
 var inflightLlm = 0;
 var llmWaiters = [];
@@ -2093,8 +2097,13 @@ var withLlmSlot = async (fn) => {
     releaseLlm();
   }
 };
-var chatModelAttempts = () => {
+var chatModelAttempts = (opts = {}) => {
   const attempts = [];
+  if (opts.few) {
+    attempts.push({ client: nvidiaChatClient, model: CV_ANALYSIS_MODEL });
+    attempts.push({ client: nvidiaChatClient2, model: CV_ANALYSIS_MODEL });
+    return attempts;
+  }
   const models = [
     "meta/muse-glimmer-30b",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
@@ -2121,9 +2130,12 @@ var describeLlmError = (err) => {
 };
 async function completeChat(messages, opts = {}) {
   const failures = [];
-  for (const attempt of chatModelAttempts()) {
+  const attempts = chatModelAttempts({ few: opts.few });
+  const perAttemptTimeout = opts.timeoutMs ?? LLM_ATTEMPT_TIMEOUT_MS;
+  const rounds = opts.noRetry ? 1 : 2;
+  for (const attempt of attempts) {
     const { client, model: model2 } = attempt;
-    for (let round = 0; round < 2; round++) {
+    for (let round = 0; round < rounds; round++) {
       const retrying = round === 1;
       try {
         let content = "";
@@ -2146,7 +2158,7 @@ async function completeChat(messages, opts = {}) {
             // muse, an explicit validation error for nemotron), which made every
             // model fail. As the second SDK argument they abort the attempt and are
             // never serialized into the payload.
-            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
+            { timeout: perAttemptTimeout, maxRetries: 0 }
           );
           for await (const chunk of completion) {
             const delta = chunk.choices?.[0]?.delta?.content;
@@ -2166,7 +2178,7 @@ async function completeChat(messages, opts = {}) {
       } catch (err) {
         const detail = describeLlmError(err);
         const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
-        if (!retrying && soft) {
+        if (!retrying && soft && !opts.noRetry) {
           failures.push(`${model2} -> ${detail}, retrying...`);
           await new Promise((r) => setTimeout(r, 1500));
           continue;
@@ -2304,8 +2316,15 @@ var seedUserCvVectors = async (cvText, userId, cvId, fileName) => {
   await index.namespace(namespace).upsert(vectors);
   return { namespace, chunks: vectors.length };
 };
+var matchesEqual = (stored, current) => {
+  if (!stored || stored.length !== current.length) return false;
+  const a = [...stored].map((id) => String(id)).sort();
+  const b = [...current].map((id) => String(id)).sort();
+  return a.every((v, i) => v === b[i]);
+};
 async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }) {
   const truncatedCVText = cvText.substring(0, 4e3);
+  const textHash = (0, import_crypto2.createHash)("sha256").update(cvText).digest("hex");
   const cvVector = await embedText(truncatedCVText);
   const index = pinecone2.index(INDEX_NAME2);
   const queryResponse = await index.query({
@@ -2316,15 +2335,34 @@ async function runCvMatch({ cvText, userId, userEmail, userName, fileName, conte
   const matchIds = queryResponse.matches.map((match) => match.id);
   const matchedOpportunities = await Opportunity_default.find({ _id: { $in: matchIds } });
   const sortedOpportunities = matchIds.map((id) => matchedOpportunities.find((o) => o._id.toString() === id)).filter(Boolean);
-  const oppsContext = sortedOpportunities.map(
-    (opp, index2) => `[${index2 + 1}] ${opp?.title} at ${opp?.organization}
+  let cv;
+  if (existingCvId) {
+    cv = await Cv_default.findById(existingCvId);
+    if (!cv) {
+      throw new Error("The saved CV no longer exists. Please upload a fresh PDF.");
+    }
+  }
+  let analysis = "";
+  if (existingCvId && cv.analysis && cv.text === cvText && matchesEqual(cv.matchIds, matchIds)) {
+    analysis = cv.analysis;
+    console.log(`CV analysis reused (matches unchanged) for userId=${userId}`);
+  } else if (!existingCvId) {
+    const prior = await Cv_default.findOne({ userId, text: cvText }).sort({ createdAt: -1 }).select("analysis matchIds").lean();
+    if (prior?.analysis && matchesEqual(prior.matchIds, matchIds)) {
+      analysis = prior.analysis;
+      console.log(`CV analysis reused (same text + matches as a previous upload) for userId=${userId}`);
+    }
+  }
+  if (!analysis) {
+    const oppsContext = sortedOpportunities.map(
+      (opp, index2) => `[${index2 + 1}] ${opp?.title} at ${opp?.organization}
 Category: ${opp?.category}
 Type: ${opp?.opportunityType}
 Location: ${opp?.location}
 Description: ${opp?.description}
 `
-  ).join("\n");
-  const prompt = `You are an expert career advisor.
+    ).join("\n");
+    const prompt = `You are an expert career advisor.
 A user has uploaded their CV, and our semantic search engine has found the top matching opportunities from our database.
 Analyze the user's CV and explain why these specific opportunities are a great match for them. Highlight their strengths and suggest the best one to apply for.
 
@@ -2335,23 +2373,19 @@ TOP MATCHING OPPORTUNITIES:
 ${oppsContext}
 
 Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
-  let analysis = "";
-  try {
-    const result = await completeChat(
-      [{ role: "user", content: prompt }],
-      { temperature: 0.7, maxTokens: 1024 }
-    );
-    analysis = result.content;
-  } catch (llmErr) {
-    console.error("All LLM models failed during CV match:", llmErr);
-    analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable \u2014 try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || "unknown"})`;
-  }
-  let cv;
-  if (existingCvId) {
-    cv = await Cv_default.findById(existingCvId);
-    if (!cv) {
-      throw new Error("The saved CV no longer exists. Please upload a fresh PDF.");
+    try {
+      const result = await completeChat(
+        [{ role: "user", content: prompt }],
+        { temperature: 0.7, maxTokens: CV_MAX_TOKENS, few: true, noRetry: true, timeoutMs: CV_ANALYSIS_TIMEOUT_MS }
+      );
+      analysis = result.content;
+    } catch (llmErr) {
+      console.error("All LLM models failed during CV match:", llmErr);
+      analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable \u2014 try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || "unknown"})`;
     }
+  }
+  const needsSeed = !cv || cv.vectorTextHash !== textHash;
+  if (existingCvId) {
     cv.userEmail = userEmail;
     cv.userName = userName;
     cv.fileName = fileName;
@@ -2364,6 +2398,7 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     cv.text = cvText;
     cv.analysis = analysis;
     cv.matchIds = sortedOpportunities.map((o) => o._id);
+    cv.vectorTextHash = textHash;
   } else {
     cv = new Cv_default({
       userId,
@@ -2375,7 +2410,8 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       ...cloudinaryId ? { cloudinaryId, cloudinaryUrl } : {},
       text: cvText,
       analysis,
-      matchIds: sortedOpportunities.map((o) => o._id)
+      matchIds: sortedOpportunities.map((o) => o._id),
+      vectorTextHash: textHash
     });
   }
   await cv.save();
@@ -2392,14 +2428,19 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       console.error("Could not remove older duplicate CVs:", dupErr);
     }
   }
-  try {
+  if (needsSeed) {
     const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
-    await withNamespaceLock(
-      cvNamespace,
-      () => seedUserCvVectors(cvText, userId, cv._id.toString(), fileName)
-    );
-  } catch (vecErr) {
-    console.error("Could not seed CV vectors to Pinecone:", vecErr);
+    const cvId = cv._id.toString();
+    void (async () => {
+      try {
+        await withNamespaceLock(
+          cvNamespace,
+          () => seedUserCvVectors(cvText, userId, cvId, fileName)
+        );
+      } catch (vecErr) {
+        console.error("Could not seed CV vectors to Pinecone:", vecErr);
+      }
+    })();
   }
   return { analysis, matches: sortedOpportunities, cvId: cv._id.toString() };
 }
@@ -2414,33 +2455,43 @@ var analyzeCV = async (req, res) => {
       res.status(400).json({ success: false, message: "Only PDF files are allowed." });
       return;
     }
-    let pdfData;
-    try {
-      pdfData = await (0, import_pdf_parse.default)(req.file.buffer);
-    } catch (pdfErr) {
-      console.error("PDF parsing failed:", pdfErr);
+    const [pdfResult, cloudResult] = await Promise.all([
+      (async () => {
+        try {
+          const pdfData = await (0, import_pdf_parse.default)(req.file.buffer);
+          return { ok: true, text: pdfData.text || "" };
+        } catch (pdfErr) {
+          return { ok: false, error: pdfErr };
+        }
+      })(),
+      (async () => {
+        try {
+          const up = await uploadCvPdf(req.file.buffer, req.file.originalname);
+          return { ok: true, cloudinaryId: up.cloudinaryId, cloudinaryUrl: up.cloudinaryUrl };
+        } catch (upErr) {
+          console.error("Cloudinary upload failed \u2014 falling back to storing the PDF in Mongo:", upErr);
+          return { ok: false, error: upErr };
+        }
+      })()
+    ]);
+    if (!pdfResult.ok) {
+      if (cloudResult.ok) void destroyCvPdf(cloudResult.cloudinaryId);
+      console.error("PDF parsing failed:", pdfResult.error);
       res.status(400).json({
         success: false,
         message: "Could not read this PDF. It may be password-protected or damaged \u2014 re-export it as a standard text PDF and try again.",
-        error: pdfErr?.message
+        error: pdfResult.error?.message
       });
       return;
     }
-    const cvText = (pdfData.text || "").trim();
+    const cvText = (pdfResult.text || "").trim();
     if (!cvText) {
       res.status(400).json({ success: false, message: "Could not extract text from the provided PDF." });
       return;
     }
     const userId = req.authUser.uid;
-    let cloudinaryId;
-    let cloudinaryUrl;
-    try {
-      const up = await uploadCvPdf(req.file.buffer, req.file.originalname);
-      cloudinaryId = up.cloudinaryId;
-      cloudinaryUrl = up.cloudinaryUrl;
-    } catch (upErr) {
-      console.error("Cloudinary upload failed \u2014 falling back to storing the PDF in Mongo:", upErr);
-    }
+    const cloudinaryId = cloudResult.ok ? cloudResult.cloudinaryId : void 0;
+    const cloudinaryUrl = cloudResult.ok ? cloudResult.cloudinaryUrl : void 0;
     const { analysis, matches, cvId } = await runCvMatch({
       cvText,
       userId,

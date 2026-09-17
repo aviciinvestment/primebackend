@@ -11,6 +11,10 @@ export interface ICv extends Document {
   // references back it. Legacy docs keep fileData until replaced.
   cloudinaryId?: string;
   cloudinaryUrl?: string;
+  // SHA-256 of the CV text that the Pinecone "chatbot memory" vectors were
+  // built from. If the current text matches, the memory is already current and
+  // re-analysis skips the delete/embed/upsert cycle entirely.
+  vectorTextHash?: string;
   text: string;
   analysis: string;
   matchIds: mongoose.Types.ObjectId[];
@@ -28,6 +32,7 @@ const CvSchema: Schema = new Schema(
     fileData: { type: Buffer },
     cloudinaryId: { type: String },
     cloudinaryUrl: { type: String },
+    vectorTextHash: { type: String },
     text: { type: String },
     analysis: { type: String },
     matchIds: [{ type: Schema.Types.ObjectId, ref: 'Opportunity' }],
