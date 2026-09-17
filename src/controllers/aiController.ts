@@ -96,19 +96,26 @@ async function completeChat(
   for (const attempt of chatModelAttempts()) {
     const { client, model } = attempt;
     try {
-      const completion = await client.chat.completions.create({
-        model,
-        messages,
-        temperature: opts.temperature ?? 0.6,
-        top_p: 0.95,
-        max_tokens: opts.maxTokens ?? 700,
-        // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
-        // reasoning models when stream:false is used. Streaming is the only
-        // reliable mode, so ALWAYS request a stream and accumulate the deltas.
-        stream: true,
-        timeout: LLM_ATTEMPT_TIMEOUT_MS,
-        maxRetries: 0,
-      });
+      const completion = await client.chat.completions.create(
+        {
+          model,
+          messages,
+          temperature: opts.temperature ?? 0.6,
+          top_p: 0.95,
+          max_tokens: opts.maxTokens ?? 700,
+          // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
+          // reasoning models when stream:false is used. Streaming is the only
+          // reliable mode, so ALWAYS request a stream and accumulate the deltas.
+          stream: true,
+        },
+        // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
+        // Passing them inside the body used to be sent to NVIDIA as
+        // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
+        // muse, an explicit validation error for nemotron), which made every
+        // model fail. As the second SDK argument they abort the attempt and are
+        // never serialized into the payload.
+        { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
+      );
       let content = '';
       for await (const chunk of completion) {
         const delta = chunk.choices?.[0]?.delta?.content;
@@ -760,17 +767,19 @@ export const chatWithAI = async (req: Request, res: Response) => {
       for (const attempt of chatModelAttempts()) {
         if (abort.signal.aborted) break;
         try {
-          const completion = await attempt.client.chat.completions.create({
-            model: attempt.model,
-            messages,
-            temperature: 0.6,
-            top_p: 0.95,
-            max_tokens: 700,
-            stream: true,
-            signal: abort.signal,
-            timeout: LLM_ATTEMPT_TIMEOUT_MS,
-            maxRetries: 0,
-          });
+          const completion = await attempt.client.chat.completions.create(
+            {
+              model: attempt.model,
+              messages,
+              temperature: 0.6,
+              top_p: 0.95,
+              max_tokens: 700,
+              stream: true,
+            },
+            // timeout/maxRetries/signal are request options — NVIDIA rejects
+            // them in the body ("Unsupported parameter(s): ...").
+            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
+          );
           streamed = true;
           for await (const chunk of completion) {
             const delta = chunk.choices?.[0]?.delta?.content;
