@@ -45,21 +45,32 @@ const nvidiaChatClient2 = new OpenAI({
   maxRetries: 1,
 });
 
-// NVIDIA-hosted chat attempts, tried in order. The two first entries are the
-// exact key+model pairs that are documented as working for this account:
-//   nvidiaChatClient            + meta/muse-glimmer-30b   (OpenAI-compat example)
-//   nvidiaChatClient2           + deepseek-ai/deepseek-v4-flash-0731 (LangChain example)
-// The remaining pairs are cross-combinations kept as automatic fallback.
+// NVIDIA-hosted chat attempts, tried in order until one returns output.
+// NVIDIA region/entitlement gates models PER REQUEST-SOURCE: a model that works
+// from one IP/region (e.g. meta/muse-glimmer-30b works from a home/US egress)
+// can return a bare HTTP 400 from another (Render's server region), while a
+// model that 404s is simply not in this account's catalog anywhere. So this is
+// a SELF-DISCOVERING battery: it fans out across the models verified good from
+// at least one request source. All of these fail FAST (400/404/500 within
+// ~1s) if they are unavailable, so the chain stays snappy, and whichever model
+// NVIDIA serves to the CURRENT request source answers the request.
 const LLM_ATTEMPT_TIMEOUT_MS = 30_000;
 
 type LlmAttempt = { client: OpenAI; model: string };
 
-const chatModelAttempts = (): LlmAttempt[] => [
-  { client: nvidiaChatClient, model: 'meta/muse-glimmer-30b' },
-  { client: nvidiaChatClient2, model: 'deepseek-ai/deepseek-v4-flash-0731' },
-  { client: nvidiaChatClient, model: 'deepseek-ai/deepseek-v4-flash-0731' },
-  { client: nvidiaChatClient2, model: 'meta/muse-glimmer-30b' },
-];
+const chatModelAttempts = (): LlmAttempt[] => {
+  const attempts: LlmAttempt[] = [];
+  const models = [
+    'meta/muse-glimmer-30b',
+    'z-ai/glm-5.3-flash',
+    'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+  ];
+  for (const model of models) {
+    attempts.push({ client: nvidiaChatClient, model });
+    attempts.push({ client: nvidiaChatClient2, model });
+  }
+  return attempts;
+};
 
 // Best-effort extraction of the REAL failure detail from a failed LLM call.
 // The OpenAI SDK often reports just "400 status code (no body)" — that text

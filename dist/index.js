@@ -1976,12 +1976,19 @@ var nvidiaChatClient2 = new import_openai2.default({
   maxRetries: 1
 });
 var LLM_ATTEMPT_TIMEOUT_MS = 3e4;
-var chatModelAttempts = () => [
-  { client: nvidiaChatClient, model: "meta/muse-glimmer-30b" },
-  { client: nvidiaChatClient2, model: "deepseek-ai/deepseek-v4-flash-0731" },
-  { client: nvidiaChatClient, model: "deepseek-ai/deepseek-v4-flash-0731" },
-  { client: nvidiaChatClient2, model: "meta/muse-glimmer-30b" }
-];
+var chatModelAttempts = () => {
+  const attempts = [];
+  const models = [
+    "meta/muse-glimmer-30b",
+    "z-ai/glm-5.3-flash",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+  ];
+  for (const model2 of models) {
+    attempts.push({ client: nvidiaChatClient, model: model2 });
+    attempts.push({ client: nvidiaChatClient2, model: model2 });
+  }
+  return attempts;
+};
 var describeLlmError = (err) => {
   const status = err?.status ? `HTTP ${err.status}` : "NO_STATUS";
   let body = "";

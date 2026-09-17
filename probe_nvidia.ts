@@ -12,7 +12,8 @@ const ENDPOINTS = [
 // Every NVIDIA-hosted chat candidate this account has been seen trying.
 const MODELS: string[] = [
   'meta/muse-glimmer-30b',
-  'deepseek-ai/deepseek-v4-flash-0731',
+  'z-ai/glm-5.3-flash',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
 ];
 
 const BASE_URL = 'https://integrate.api.nvidia.com/v1';
