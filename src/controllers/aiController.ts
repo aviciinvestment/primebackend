@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { createHash } from 'crypto';
-import { isValidObjectId } from 'mongoose';
+import { isValidObjectId, Types } from 'mongoose';
 import pdfParse from 'pdf-parse';
 import { Pinecone } from '@pinecone-database/pinecone';
 import OpenAI from 'openai';
@@ -57,32 +57,78 @@ const nvidiaChatClient2 = new OpenAI({
 // NVIDIA serves to the CURRENT request source answers the request.
 const LLM_ATTEMPT_TIMEOUT_MS = 30_000;
 
-// CV analysis uses a deliberately SHORT chain: one historically-reliable model
-// across both NVIDIA keys, a tighter timeout, and no "try the same model
-// twice". This keeps the worst case at ~one quick attempt instead of many
-// (each with its own 30s timeout), which is why analysis could feel endless.
-const CV_ANALYSIS_MODEL = 'meta/muse-glimmer-30b';
-const CV_ANALYSIS_TIMEOUT_MS = 20_000;
-const CV_MAX_TOKENS = 1024; // analysis summary target
+// Upper cap on the CV text stored per upload. Matching only ever embeds the
+// first 4,000 chars and the chat-memory seeder only uses the first ~5 chunks
+// (~4,300 chars), so anything past this is pure bloat; it also bounds the
+// decompression-bomb exposure of a 16MB-doc pdf-parse.
+const CV_TEXT_MAX_CHARS = 20_000;
 
 type LlmAttempt = { client: OpenAI; model: string };
 
 // Cap concurrent outbound NVIDIA calls so a spike of users can't open unbounded
 // parallel streams (the free tier throttles with 429 / ResourceExhausted under
 // load). A bounded in-flight gate keeps provider load flat so the soft-failure
-// retries above stay effective instead of compounding the flood.
-const MAX_INFLIGHT_LLM = 5;
+// retries stay effective instead of compounding the flood.
+const MAX_INFLIGHT_LLM = Math.min(
+  Math.max(parseInt(process.env.LLM_MAX_INFLIGHT || '5', 10) || 5, 1),
+  20
+);
+
+// How long an LLM call may wait for a free slot before failing fast. Without a
+// deadline, a provider blip drains the bounded queue and every healthy request
+// behind it blocks for the whole attempt chain (minutes) — fail fast with 503
+// instead, so the user can simply retry now.
+const LLM_SLOT_WAIT_MS = Math.min(
+  Math.max(parseInt(process.env.LLM_SLOT_WAIT_MS || '15000', 10) || 15000, 1000),
+  120000
+);
+
+// Wall-clock budget for one full chat response (all attempts summed). Once it
+// elapses the loop stops trying new models/keys so a chat can never run for
+// minutes even if every provider is slow.
+const CHAT_WALL_CLOCK_MS = Math.min(
+  Math.max(parseInt(process.env.CHAT_WALL_CLOCK_MS || '60000', 10) || 60000, 5000),
+  180000
+);
+
 let inflightLlm = 0;
 const llmWaiters: Array<() => void> = [];
 
-const acquireLlm = async (): Promise<void> => {
-  while (inflightLlm >= MAX_INFLIGHT_LLM) {
-    await new Promise<void>(resolve => {
-      llmWaiters.push(resolve);
-    });
+// Thrown when no LLM slot freed up within LLM_SLOT_WAIT_MS. Callers map it to a
+// clean "server busy" response and MUST NOT treat it as a provider failure that
+// triggers more attempts (that would pile onto the queue they just timed out on).
+class LlmBusyError extends Error {
+  constructor() {
+    super('Too many concurrent AI requests at the moment.');
+    this.name = 'LlmBusyError';
   }
-  inflightLlm += 1;
-};
+}
+
+// Acquire a slot within timeoutMs; resolves false (without consuming a slot)
+// if the wait times out. The queued entry re-checks on wake-up so a racing
+// release can never over-allocate a slot.
+const waitForLlmSlot = (timeoutMs: number): Promise<boolean> =>
+  new Promise(resolve => {
+    if (inflightLlm < MAX_INFLIGHT_LLM) {
+      inflightLlm += 1;
+      resolve(true);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const entry = () => {
+      if (inflightLlm < MAX_INFLIGHT_LLM) {
+        inflightLlm += 1;
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(true);
+      }
+    };
+    llmWaiters.push(entry);
+    timer = setTimeout(() => {
+      const idx = llmWaiters.indexOf(entry);
+      if (idx >= 0) llmWaiters.splice(idx, 1);
+      resolve(false);
+    }, timeoutMs);
+  });
 
 const releaseLlm = (): void => {
   inflightLlm -= 1;
@@ -91,9 +137,11 @@ const releaseLlm = (): void => {
 
 // Runs `fn` while holding one LLM slot (acquired before, released in finally).
 // The slot is held for the WHOLE attempt, including stream consumption, so at
-// most MAX_INFLIGHT_LLM providers/streams are ever open at once.
-const withLlmSlot = async <T>(fn: () => Promise<T>): Promise<T> => {
-  await acquireLlm();
+// most MAX_INFLIGHT_LLM providers/streams are ever open at once. Throws
+// LlmBusyError when no slot becomes free within the wait deadline.
+const withLlmSlot = async <T>(fn: () => Promise<T>, timeoutMs: number = LLM_SLOT_WAIT_MS): Promise<T> => {
+  const acquired = await waitForLlmSlot(timeoutMs);
+  if (!acquired) throw new LlmBusyError();
   try {
     return await fn();
   } finally {
@@ -101,14 +149,8 @@ const withLlmSlot = async <T>(fn: () => Promise<T>): Promise<T> => {
   }
 };
 
-const chatModelAttempts = (opts: { few?: boolean } = {}): LlmAttempt[] => {
+const chatModelAttempts = (): LlmAttempt[] => {
   const attempts: LlmAttempt[] = [];
-  if (opts.few) {
-    // CV-analysis mode: one reliable model, both NVIDIA keys as fallback.
-    attempts.push({ client: nvidiaChatClient, model: CV_ANALYSIS_MODEL });
-    attempts.push({ client: nvidiaChatClient2, model: CV_ANALYSIS_MODEL });
-    return attempts;
-  }
   const models = [
     'meta/muse-glimmer-30b',
     'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
@@ -142,22 +184,23 @@ async function completeChat(
   opts: {
     temperature?: number;
     maxTokens?: number;
-    few?: boolean;      // CV analysis: short model chain (see chatModelAttempts)
-    noRetry?: boolean;  // CV analysis: skip the per-model soft-failure retry
-    timeoutMs?: number; // per-attempt timeout; defaults to the chat timeout
+    deadlineMs?: number; // wall-clock budget for the whole attempt chain
   } = {}
 ): Promise<{ content: string; model: string }> {
   const failures: string[] = [];
-  const attempts = chatModelAttempts({ few: opts.few });
-  const perAttemptTimeout = opts.timeoutMs ?? LLM_ATTEMPT_TIMEOUT_MS;
-  const rounds = opts.noRetry ? 1 : 2;
+  const startedAt = Date.now();
+  const deadline = startedAt + (opts.deadlineMs ?? CHAT_WALL_CLOCK_MS);
+  const attempts = chatModelAttempts();
   for (const attempt of attempts) {
+    if (Date.now() >= deadline) break;
     const { client, model } = attempt;
     // One immediate retry per model for SOFT failures (empty stream, timeouts,
     // NVIDIA capacity "ResourceExhausted", 429/overloaded). NVIDIA shards can
     // return an empty stream or refuse capacity on the first hit and answer on
-    // the retry; hard failures (400/404) skip ahead instantly.
-    for (let round = 0; round < rounds; round++) {
+    // the retry; hard failures (400/404) skip ahead instantly. Retries are
+    // immediate (no backoff) and the wall-clock deadline bounds the whole chain.
+    for (let round = 0; round < 2; round++) {
+      if (Date.now() >= deadline) break;
       const retrying = round === 1;
       try {
         let content = '';
@@ -182,7 +225,7 @@ async function completeChat(
             // muse, an explicit validation error for nemotron), which made every
             // model fail. As the second SDK argument they abort the attempt and are
             // never serialized into the payload.
-            { timeout: perAttemptTimeout, maxRetries: 0 }
+            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
           );
           for await (const chunk of completion) {
             const delta = chunk.choices?.[0]?.delta?.content;
@@ -193,21 +236,14 @@ async function completeChat(
           console.log(`LLM OK via ${model}`);
           return { content, model };
         }
-        if (!retrying) {
-          failures.push(`${model} -> empty completion, retrying...`);
-          await new Promise(r => setTimeout(r, 1500));
-          continue;
-        }
-        failures.push(`${model} -> empty completion`);
+        failures.push(`${model} -> empty completion${retrying ? '' : ', retrying...'}`);
+        if (!retrying) continue;
       } catch (err: any) {
+        if (err instanceof LlmBusyError) throw err;
         const detail = describeLlmError(err);
         const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
-        if (!retrying && soft && !opts.noRetry) {
-          failures.push(`${model} -> ${detail}, retrying...`);
-          await new Promise(r => setTimeout(r, 1500));
-          continue;
-        }
-        failures.push(`${model} -> ${detail}`);
+        failures.push(`${model} -> ${detail}${!retrying && soft ? ', retrying...' : ''}`);
+        if (!retrying && soft) continue;
         console.warn(`LLM model ${model} failed: ${detail}`);
       }
       break;
@@ -422,12 +458,14 @@ const seedUserCvVectors = async (
 };
 
 // ---------------------------------------------------------------------------
-// Shared CV-match pipeline: embed → Pinecone query → LLM analysis → persist
-// Used by both the initial analyzeCV (PDF upload) and the new reanalyzeCV
-// (stored-text re-analysis) so the two paths stay identical.
+// Shared CV-match pipeline: embed → Pinecone query → persist
+// Used by the analyzeCV (PDF upload) endpoint and by the background
+// cv-match-refresh job so the two paths stay identical. There is NO LLM step
+// here: matching is pure embedding + vector similarity, which keeps uploads to
+// ~1-2s and lets the refresh job recompute every user's matches daily.
 // ---------------------------------------------------------------------------
 
-interface RunCvMatchArgs {
+interface ComputeCvMatchesArgs {
   cvText: string;
   userId: string;
   userEmail: string;
@@ -441,7 +479,7 @@ interface RunCvMatchArgs {
   cloudinaryId?: string;
   cloudinaryUrl?: string;
   // When set, refresh the existing CV doc instead of creating a duplicate
-  // record (Refresh was creating a brand-new Cv on every click).
+  // record.
   existingCvId?: string;
   // On a fresh upload, delete the user's OLDER CVs that share the same file
   // name so re-uploads don't pile up identical twins in the list.
@@ -458,7 +496,7 @@ const matchesEqual = (stored: unknown[] | undefined | null, current: string[]): 
   return a.every((v, i) => v === b[i]);
 };
 
-async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }: RunCvMatchArgs) {
+async function computeCvMatches({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }: ComputeCvMatchesArgs) {
   const truncatedCVText = cvText.substring(0, 4000);
   const textHash = createHash('sha256').update(cvText).digest('hex');
 
@@ -477,10 +515,10 @@ async function runCvMatch({ cvText, userId, userEmail, userName, fileName, conte
     .map(id => matchedOpportunities.find(o => o._id.toString() === id))
     .filter(Boolean);
 
-  // Upsert semantics: Refresh updates the existing doc in place (no new
-  // record); a fresh upload replaces older records with the SAME fileName so
-  // re-uploads never pile up identical twins (which made "delete" look broken
-  // — deleting one copy left another identical one in the list).
+  // Upsert semantics: an existing doc is updated in place (no new record); a
+  // fresh upload replaces older records with the SAME fileName so re-uploads
+  // never pile up identical twins (which made "delete" look broken — deleting
+  // one copy left another identical one in the list).
   let cv: any;
   if (existingCvId) {
     cv = await Cv.findById(existingCvId);
@@ -489,61 +527,9 @@ async function runCvMatch({ cvText, userId, userEmail, userName, fileName, conte
     }
   }
 
-  // Fast path: if the CV text AND the matched set are unchanged, the new summary
-  // would be identical to the saved one — reuse it and skip the LLM entirely.
-  // This is what makes "re-analyse/refresh" instant unless opportunities changed.
-  let analysis = '';
-  if (existingCvId && cv.analysis && cv.text === cvText && matchesEqual(cv.matchIds, matchIds)) {
-    analysis = cv.analysis;
-    console.log(`CV analysis reused (matches unchanged) for userId=${userId}`);
-  } else if (!existingCvId) {
-    const prior = await Cv.findOne({ userId, text: cvText })
-      .sort({ createdAt: -1 })
-      .select('analysis matchIds')
-      .lean();
-    if (prior?.analysis && matchesEqual(prior.matchIds, matchIds)) {
-      analysis = prior.analysis;
-      console.log(`CV analysis reused (same text + matches as a previous upload) for userId=${userId}`);
-    }
-  }
-
-  if (!analysis) {
-    const oppsContext = sortedOpportunities.map((opp, index) =>
-      `[${index + 1}] ${opp?.title} at ${opp?.organization}\nCategory: ${opp?.category}\nType: ${opp?.opportunityType}\nLocation: ${opp?.location}\nDescription: ${opp?.description}\n`
-    ).join('\n');
-
-    const prompt = `You are an expert career advisor.
-A user has uploaded their CV, and our semantic search engine has found the top matching opportunities from our database.
-Analyze the user's CV and explain why these specific opportunities are a great match for them. Highlight their strengths and suggest the best one to apply for.
-
-USER CV:
-${truncatedCVText}
-
-TOP MATCHING OPPORTUNITIES:
-${oppsContext}
-
-Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
-
-    // LLM summary is best-effort: the top matches are still valid even if every
-    // configured chat model is briefly down/rate-limited, so degrade gracefully
-    // instead of 500-ing the whole analysis. The last failure reason is included
-    // in the note so the real cause is visible in the UI (and pastable to logs).
-    // Uses the SHORT model chain (few/noRetry/tighter timeout) so a busy NVIDIA
-    // provider can no longer hold the analysis hostage for minutes.
-    try {
-      const result = await completeChat(
-        [{ role: 'user', content: prompt }],
-        { temperature: 0.7, maxTokens: CV_MAX_TOKENS, few: true, noRetry: true, timeoutMs: CV_ANALYSIS_TIMEOUT_MS }
-      );
-      analysis = result.content;
-    } catch (llmErr: any) {
-      console.error('All LLM models failed during CV match:', llmErr);
-      analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable — try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || 'unknown'})`;
-    }
-  }
-
-  // Chat-memory re-seeding is only needed when the text actually changed; when
-  // it did, run it in the background so it never holds up the user's answer.
+  // Chat-memory re-seeding is needed when the text actually changed (or this
+  // is a brand-new CV); it runs in the background so it never holds up the
+  // user's answer.
   const needsSeed = !cv || cv.vectorTextHash !== textHash;
 
   if (existingCvId) {
@@ -557,7 +543,6 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       cv.cloudinaryUrl = cloudinaryUrl || cv.cloudinaryUrl;
     }
     cv.text = cvText;
-    cv.analysis = analysis;
     cv.matchIds = sortedOpportunities.map(o => o!._id);
     cv.vectorTextHash = textHash;
   } else {
@@ -570,7 +555,6 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       ...(fileData ? { fileData } : {}),
       ...(cloudinaryId ? { cloudinaryId, cloudinaryUrl } : {}),
       text: cvText,
-      analysis,
       matchIds: sortedOpportunities.map(o => o!._id),
       vectorTextHash: textHash,
     });
@@ -596,9 +580,9 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
   }
 
   // Seed CV vectors into the user's private Pinecone namespace so the chat
-  // assistant has personalized context. Fire-and-forget: the analysis result
-  // does not depend on it, and failure is non-fatal. The per-namespace mutex
-  // keeps concurrent seeds from stomping each other.
+  // assistant has personalized context. Fire-and-forget: the match result does
+  // not depend on it, and failure is non-fatal. The per-namespace mutex keeps
+  // concurrent seeds from stomping each other.
   if (needsSeed) {
     const cvNamespace = `${CV_NAMESPACE_PREFIX}${userId}`;
     const cvId = cv._id.toString();
@@ -613,10 +597,13 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     })();
   }
 
-  return { analysis, matches: sortedOpportunities, cvId: cv._id.toString() };
+  return { matches: sortedOpportunities, cvId: cv._id.toString() };
 }
 
 // ---- CV Analysis (PDF upload) --------------------------------------------
+// Lightweight on purpose: PDF text extraction + Cloudinary upload run in
+// parallel, then the text is capped and matched against the current feed
+// (embed + Pinecone query, ~1-2s). No LLM summary is produced on this path.
 
 export const analyzeCV = async (req: Request, res: Response) => {
   try {
@@ -668,11 +655,10 @@ export const analyzeCV = async (req: Request, res: Response) => {
         success: false,
         message:
           'Could not read this PDF. It may be password-protected or damaged — re-export it as a standard text PDF and try again.',
-        error: pdfResult.error?.message,
       });
       return;
     }
-    const cvText = (pdfResult.text || '').trim();
+    const cvText = (pdfResult.text || '').trim().slice(0, CV_TEXT_MAX_CHARS);
 
     if (!cvText) {
       res.status(400).json({ success: false, message: 'Could not extract text from the provided PDF.' });
@@ -681,12 +667,12 @@ export const analyzeCV = async (req: Request, res: Response) => {
 
     const userId = req.authUser!.uid;
 
-    // Cloudinary kept the PDF out of Mongo (it never blocks the analysis); if
-    // it was unavailable, the in-Mongo buffer is used so downloads never break.
+    // Cloudinary keeps the PDF out of Mongo; if it was unavailable, the
+    // in-Mongo buffer is used so downloads never break.
     const cloudinaryId = cloudResult.ok ? cloudResult.cloudinaryId : undefined;
     const cloudinaryUrl = cloudResult.ok ? cloudResult.cloudinaryUrl : undefined;
 
-    const { analysis, matches, cvId } = await runCvMatch({
+    const { matches, cvId } = await computeCvMatches({
       cvText,
       userId,
       userEmail: req.authUser!.email || '',
@@ -699,56 +685,12 @@ export const analyzeCV = async (req: Request, res: Response) => {
       replaceSameFile: true,
     });
 
-    res.json({ success: true, analysis, matches, cvId });
+    res.json({ success: true, matches, cvId });
   } catch (error: any) {
     console.error('Error analyzing CV:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to analyze CV.',
-      error: error.message,
-    });
-  }
-};
-
-// ---- CV Re-analysis (reload against latest opportunities) -----------------
-// Uses the stored CV text + metadata from the user's most recent upload so no
-// file transfer is needed. Produces a fresh analysis against the current
-// Pinecone index (which contains newly synced opportunities).
-
-export const reanalyzeCV = async (req: Request, res: Response) => {
-  try {
-    const userId = req.authUser!.uid;
-
-    const latestCv = await Cv.findOne({ userId }).sort({ createdAt: -1 });
-    if (!latestCv) {
-      res.status(400).json({ success: false, message: 'No saved CV found. Upload a CV first.' });
-      return;
-    }
-
-    const cvText = (latestCv.text || '').trim();
-    if (!cvText) {
-      res.status(400).json({ success: false, message: 'Saved CV has no extractable text. Upload a fresh PDF.' });
-      return;
-    }
-
-    const { analysis, matches, cvId } = await runCvMatch({
-      cvText,
-      userId,
-      userEmail: req.authUser!.email || latestCv.userEmail || '',
-      fileName: latestCv.fileName,
-      contentType: latestCv.contentType,
-      fileData: latestCv.fileData,
-      userName: req.body?.userName || latestCv.userName || '',
-      existingCvId: latestCv._id.toString(),
-    });
-
-    res.json({ success: true, analysis, matches, cvId });
-  } catch (error: any) {
-    console.error('Error re-analyzing CV:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to re-analyze CV.',
-      error: error.message,
     });
   }
 };
@@ -982,9 +924,11 @@ export const chatWithAI = async (req: Request, res: Response) => {
     if (stream) {
       let reply = '';
       let streamed = false;
+      const chatDeadline = Date.now() + CHAT_WALL_CLOCK_MS;
       for (const attempt of chatModelAttempts()) {
-        if (abort.signal.aborted) break;
+        if (abort.signal.aborted || Date.now() >= chatDeadline) break;
         for (let round = 0; round < 2; round++) {
+          if (abort.signal.aborted || Date.now() >= chatDeadline) break;
           const retrying = round === 1;
           try {
             // Hold a concurrency slot for create + stream consumption (see
@@ -1001,7 +945,7 @@ export const chatWithAI = async (req: Request, res: Response) => {
                 },
                 // timeout/maxRetries/signal are request options — NVIDIA rejects
                 // them in the body ("Unsupported parameter(s): ...").
-                { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
+                { timeout: Math.min(LLM_ATTEMPT_TIMEOUT_MS, chatDeadline - Date.now()), maxRetries: 0, signal: abort.signal }
               );
               streamed = true;
               for await (const chunk of completion) {
@@ -1014,13 +958,14 @@ export const chatWithAI = async (req: Request, res: Response) => {
             });
             if (reply.trim()) break;
           } catch (err: any) {
+            if (err instanceof LlmBusyError) {
+              writeSse({ type: 'error', message: 'The AI is busy right now — too many requests at once. Please try again in a moment.' });
+              return res.end();
+            }
             const detail = describeLlmError(err);
             const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
-            console.warn(`Chat stream model ${attempt.model} failed: ${detail}${retrying ? '' : ', retrying...'}`);
-            if (!retrying && soft) {
-              await new Promise(r => setTimeout(r, 1500));
-              continue;
-            }
+            console.warn(`Chat stream model ${attempt.model} failed: ${detail}${!retrying && soft ? ', retrying...' : ''}`);
+            if (!retrying && soft) continue;
           }
           break;
         }
@@ -1046,6 +991,17 @@ export const chatWithAI = async (req: Request, res: Response) => {
     aiReplyCache.set(cacheKey, { reply });
     res.json({ success: true, reply });
   } catch (error: any) {
+    // A busy gate is a TRANSIENT condition (queue full for a moment), handled
+    // distinctly from a real failure so the user can simply retry right away.
+    if (error instanceof LlmBusyError) {
+      console.log('AI chat deferred: LLM slot queue full.');
+      if (res.headersSent && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: 'The AI is busy right now — too many requests at once. Please try again in a moment.' })}\n\n`);
+        return res.end();
+      }
+      res.status(503).json({ success: false, message: 'The AI is busy right now — too many requests at once. Please try again in a moment.' });
+      return;
+    }
     console.error('Error in AI chat:', error);
     // If we already started an SSE stream, send a terminal error frame instead
     // of a JSON 500 (the client would choke trying to parse it).
@@ -1056,7 +1012,6 @@ export const chatWithAI = async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       message: 'Failed to process chat message.',
-      error: error.message,
     });
   }
 };
@@ -1087,8 +1042,8 @@ const SKILL_KEYWORDS = [
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-const extractCvHighlights = (cvText: string, analysis: string = '') => {
-  const source = `${cvText}\n${analysis}`.toLowerCase();
+const extractCvHighlights = (cvText: string) => {
+  const source = cvText.toLowerCase();
 
   const roles = ROLE_KEYWORDS.filter(kw =>
     new RegExp(escapeRegExp(kw), 'i').test(source)
@@ -1099,8 +1054,8 @@ const extractCvHighlights = (cvText: string, analysis: string = '') => {
     return new RegExp(`\\b${pattern}\\b`, 'i').test(source);
   }).slice(0, 12);
 
-  // Education is derived from the raw CV text only (not the AI analysis, which
-  // can mention other people/roles and produce false positives).
+  // Education is derived from the raw CV text only (never from generated text,
+  // which can mention other people/roles and produce false positives).
   const eduMatches: string[] = [];
   // Degree lines
   const degreeRe = /(?:(?:BSc|B\.Sc|BEng|B\.Eng|Bachelor(?:'?s)?|MSc|M\.Eng|MEng|M\.Sc|Master(?:'?s)?|HND|OND)\s+[^.,;\n]{3,60})/gi;
@@ -1134,10 +1089,9 @@ export const getMyCVs = async (req: Request, res: Response) => {
       cvs: cvs.map(cv => ({
         _id: cv._id,
         fileName: cv.fileName,
-        analysis: cv.analysis,
         createdAt: cv.createdAt,
         matches: cv.matchIds,
-        highlights: extractCvHighlights(cv.text || '', cv.analysis || ''),
+        highlights: extractCvHighlights(cv.text || ''),
       })),
     });
   } catch (error: any) {
@@ -1145,7 +1099,6 @@ export const getMyCVs = async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch CVs.',
-      error: error.message,
     });
   }
 };
@@ -1165,21 +1118,42 @@ export const downloadCV = async (req: Request, res: Response) => {
       return;
     }
 
-    // New uploads live on Cloudinary: redirect straight to the public CDN URL
-    // (single hop; the asset URL is stored at upload time).
-    if (cv.cloudinaryUrl) {
-      return res.redirect(302, cv.cloudinaryUrl);
-    }
-
     const safeName = (cv.fileName || 'cv.pdf').replace(/[^\w.\- ]/g, '').replace(/"/g, '');
     res.setHeader('Content-Type', cv.contentType || 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'cv.pdf'}"`);
 
+    // New uploads live on Cloudinary. We PROXY the bytes through this
+    // authenticated route (a 302 to the public CDN URL would hand out the raw,
+    // unauthenticated PDF to anyone who captured/copied the URL), streaming the
+    // response instead of buffering the whole file in memory.
+    if (cv.cloudinaryUrl) {
+      const upstream = await fetch(cv.cloudinaryUrl, { signal: AbortSignal.timeout(30_000) });
+      if (!upstream.ok || !upstream.body) {
+        throw new Error(`Cloudinary fetch failed (HTTP ${upstream.status}).`);
+      }
+      const contentLength = upstream.headers.get('Content-Length');
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+      // Stream the remote body straight to the client.
+      const reader = upstream.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) res.write(value);
+        if (res.writableEnded) break;
+      }
+      return res.end();
+    }
+
     // Legacy docs keep the buffer in Mongo.
+    if (!cv.fileData) throw new Error('This CV has no stored file.');
     res.send(cv.fileData);
   } catch (error: any) {
     console.error('Error downloading CV:', error);
-    res.status(500).json({ success: false, message: 'Failed to download CV.' });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Failed to download CV.' });
+    } else {
+      res.end();
+    }
   }
 };
 
@@ -1218,9 +1192,110 @@ export const deleteCV = async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       message: 'Failed to delete CV.',
-      error: error.message,
     });
   }
+};
+
+// ---- Background CV-match refresh ------------------------------------------
+// Keeps every user's saved CV matches in sync with the CURRENT feed. The feed
+// changes daily (opportunity sync inserts/closes listings), so the "Filter by
+// CV" feed would otherwise go stale until the user re-uploaded. This job re-runs
+// the SAME match-only pipeline (embed → Pinecone query) that analyzeCV uses —
+// no LLM — per user's latest CV, writes new matchIds, and back-fills chat-memory
+// vectors when a stored CV changed. Runs after each opportunity sync AND on a
+// daily cron (see index.ts). Concurrency-bounded so it never floods NVIDIA/Pinecone.
+
+interface CvRefreshSummary {
+  users: number;
+  refreshed: number;
+  seeded: number;
+  failed: number;
+  durationMs: number;
+}
+
+export const refreshCvMatches = async (): Promise<CvRefreshSummary> => {
+  const startedAt = Date.now();
+  let refreshed = 0;
+  let seeded = 0;
+  let failed = 0;
+
+  // One row per user: their most recent CV (aggregate keeps this O(1) per row).
+  const latestByUser = await Cv.aggregate<{ _id: string; doc?: any }>([
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: '$userId', doc: { $first: '$$ROOT' } } },
+    { $match: { 'doc.text': { $exists: true, $ne: '' } } },
+  ]);
+  const docs = latestByUser
+    .map(g => g.doc)
+    .filter((d): d is any => !!d && typeof d.text === 'string');
+
+  const index = pinecone.index(INDEX_NAME);
+
+  const processDoc = async (doc: any) => {
+    const text = (doc.text || '').slice(0, 4000);
+    const textHash = createHash('sha256').update(doc.text || '').digest('hex');
+    try {
+      const vector = await embedText(text);
+      const queryResponse = await index.query({
+        vector,
+        topK: 5,
+        includeMetadata: true,
+      });
+      const matchIds = queryResponse.matches
+        .map(match => match.id)
+        .filter(id => /^[0-9a-fA-F]{24}$/.test(id));
+
+      const isObjectIdArray = Array.isArray(doc.matchIds);
+      if (!(isObjectIdArray && matchesEqual(doc.matchIds, matchIds))) {
+        await Cv.updateOne(
+          { _id: doc._id },
+          { $set: { matchIds: matchIds.map(id => new Types.ObjectId(id)) } }
+        );
+        refreshed += 1;
+      }
+
+      // Chat-memory re-seed only when the stored CV text changed since the
+      // vectors were built; guarded by the per-namespace mutex.
+      if (doc.vectorTextHash !== textHash) {
+        await withNamespaceLock(`${CV_NAMESPACE_PREFIX}${doc.userId}`, () =>
+          seedUserCvVectors(doc.text || '', doc.userId, doc._id.toString(), doc.fileName || 'cv.pdf')
+        );
+        await Cv.updateOne({ _id: doc._id }, { $set: { vectorTextHash: textHash } });
+        seeded += 1;
+      }
+    } catch (err) {
+      failed += 1;
+      console.error(`CV match refresh failed for userId=${doc.userId}:`, err);
+    }
+  };
+
+  const CONCURRENCY = Math.min(
+    4,
+    Math.max(1, parseInt(process.env.CV_REFRESH_CONCURRENCY || '4', 10) || 4)
+  );
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < docs.length) {
+      const doc = docs[cursor];
+      cursor += 1;
+      await processDoc(doc);
+    }
+  };
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  if (docs.length > 0) {
+    console.log(
+      `[cv-refresh] checked ${docs.length} user CVs: ${refreshed} refreshed, ${seeded} seeded, ${failed} failed in ${Date.now() - startedAt}ms`
+    );
+  }
+
+  return {
+    users: docs.length,
+    refreshed,
+    seeded,
+    failed,
+    durationMs: Date.now() - startedAt,
+  };
 };
 
 // ---- Endpoints directly consumed by the Cloudflare Worker -------------------

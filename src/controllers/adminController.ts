@@ -7,6 +7,24 @@ import MentorshipComplaint from '../models/MentorshipComplaint';
 
 const PLATFORM_CUT = 0.1; // platform keeps 10% of every mentee payment
 
+// Admin list pagination: bounded page/limit parsing (B-05). The admin list
+// endpoints used to return the ENTIRE table per request; as users/mentees grow
+// that meant megabyte JSON payloads and unbounded sort/skip work. Defaults to
+// 100 rows/page, clamped to 200, with the pages/total the client needs for
+// "load more" buttons.
+const ADMIN_LIST_LIMIT = 100;
+const ADMIN_LIST_MAX_LIMIT = 200;
+
+const parsePagination = (req: Request): { page: number; limit: number; skip: number } => {
+  const rawPage = parseInt(String(req.query.page ?? ''), 10);
+  const rawLimit = parseInt(String(req.query.limit ?? ''), 10);
+  const page = Number.isFinite(rawPage) && rawPage >= 1 ? rawPage : 1;
+  const limit = Number.isFinite(rawLimit) && rawLimit >= 1
+    ? Math.min(rawLimit, ADMIN_LIST_MAX_LIMIT)
+    : ADMIN_LIST_LIMIT;
+  return { page, limit, skip: (page - 1) * limit };
+};
+
 export const getOverview = async (_req: Request, res: Response) => {
   try {
     const [totalUsers, totalMentors, pendingMentorApplications, totalMentees, revenueAgg] =
@@ -41,9 +59,13 @@ export const getOverview = async (_req: Request, res: Response) => {
   }
 };
 
-export const listUsers = async (_req: Request, res: Response) => {
+export const listUsers = async (req: Request, res: Response) => {
   try {
-    const users = await AppUser.find().sort({ createdAt: -1 }).lean();
+    const { page, limit, skip } = parsePagination(req);
+    const [users, total] = await Promise.all([
+      AppUser.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      AppUser.countDocuments(),
+    ]);
     res.json({
       success: true,
       users: users.map(u => ({
@@ -55,6 +77,9 @@ export const listUsers = async (_req: Request, res: Response) => {
         createdAt: u.createdAt,
         mentorshipInterest: u.mentorshipInterest || null,
       })),
+      total,
+      page,
+      pages: Math.ceil(total / limit),
     });
   } catch (error: any) {
     console.error('Failed to list users:', error);
@@ -62,9 +87,13 @@ export const listUsers = async (_req: Request, res: Response) => {
   }
 };
 
-export const listMentors = async (_req: Request, res: Response) => {
+export const listMentors = async (req: Request, res: Response) => {
   try {
-    const mentors = await Mentor.find().sort({ createdAt: -1 }).lean();
+    const { page, limit, skip } = parsePagination(req);
+    const [mentors, total] = await Promise.all([
+      Mentor.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Mentor.countDocuments(),
+    ]);
 
     // One aggregation for every mentor's paid count + gross instead of N+1 queries.
     const stats = await Mentorship.aggregate<{ mentorId: string; total: number; gross: number }>([
@@ -91,16 +120,20 @@ export const listMentors = async (_req: Request, res: Response) => {
       };
     });
 
-    res.json({ success: true, mentors: results });
+    res.json({ success: true, mentors: results, total, page, pages: Math.ceil(total / limit) });
   } catch (error: any) {
     console.error('Failed to list mentors:', error);
     res.status(500).json({ success: false, error: 'Failed to list mentors.' });
   }
 };
 
-export const listMentees = async (_req: Request, res: Response) => {
+export const listMentees = async (req: Request, res: Response) => {
   try {
-    const requests = await Mentorship.find({ status: 'paid' }).sort({ createdAt: -1 }).lean();
+    const { page, limit, skip } = parsePagination(req);
+    const [requests, total] = await Promise.all([
+      Mentorship.find({ status: 'paid' }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Mentorship.countDocuments({ status: 'paid' }),
+    ]);
     res.json({
       success: true,
       mentees: requests.map(r => ({
@@ -119,6 +152,9 @@ export const listMentees = async (_req: Request, res: Response) => {
         reference: r.reference,
         createdAt: r.createdAt,
       })),
+      total,
+      page,
+      pages: Math.ceil(total / limit),
     });
   } catch (error: any) {
     console.error('Failed to list mentees:', error);

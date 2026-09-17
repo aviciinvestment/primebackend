@@ -24,12 +24,22 @@ const makeOptions = (name: string, limit: number, opts: Partial<Options> = {}): 
   standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
   handler: errorJson,
-  // req.ip is set by 'trust proxy' from the proxy chain; ipKeyGenerator
+  // req.ip is set by 'trust proxy' (1 hop) from the proxy chain; ipKeyGenerator
   // normalizes IPv6 -> /56 subnet so limit keys don't collide per-address when
   // the proxy forwards IPv6 clients. Prefix it so each limiter owns a disjoint
   // key space in the shared Mongo collection.
-  keyGenerator: (req: Request) =>
-    `${name}:${ipKeyGenerator(req.ip || req.socket.remoteAddress || 'unknown')}`,
+  //
+  // CF-Connecting-IP is set by Cloudflare at the edge and cannot be spoofed by
+  // a caller, so requests that arrive THROUGH the Worker (chat context/complaint
+  // endpoints) get their true client IP keyed directly from it. Direct-to-Render
+  // requests have no such header and fall back to req.ip (trust proxy 1 already
+  // consumed the trusted hop). Prefer it over req.ip so the un-trusted-but-CF-set
+  // header wins where available.
+  keyGenerator: (req: Request) => {
+    const cfIp = (req.headers['cf-connecting-ip'] as string) || '';
+    const ip = cfIp || req.ip || req.socket.remoteAddress || 'unknown';
+    return `${name}:${ipKeyGenerator(ip)}`;
+  },
   ...opts,
 });
 

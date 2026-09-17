@@ -29,7 +29,7 @@ export const getApplications = async (req: Request, res: Response) => {
     res.json({ success: true, count: apps.length, data: apps.map(populateApplication) });
   } catch (error: any) {
     console.error('Error fetching applications:', error);
-    res.status(500).json({ success: false, message: 'Server Error', error: error.message });
+    res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
 
@@ -100,6 +100,6 @@ export const upsertApplication = async (req: Request, res: Response) => {
     res.json({ success: true, data: populateApplication(populated) });
   } catch (error: any) {
     console.error('Error upserting application:', error);
-    res.status(500).json({ success: false, message: 'Server Error', error: error.message });
+    res.status(500).json({ success: false, message: 'Server Error' });
   }
 };

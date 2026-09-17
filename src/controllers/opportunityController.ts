@@ -396,7 +396,6 @@ export const getOpportunities = async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       message: 'Server Error',
-      error: error.message
     });
   }
 };
@@ -475,7 +474,7 @@ export const createManualOpportunity = async (req: Request, res: Response) => {
     res.status(201).json({ success: true, data: doc });
   } catch (error: any) {
     console.error('Error creating manual opportunity:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to create the opportunity.' });
   }
 };
 

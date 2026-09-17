@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import { runOpportunitySync } from './services/syncOpportunities';
 import { autoLaunchIfDue } from './controllers/launchController';
+import { refreshCvMatches } from './controllers/aiController';
 import { apiLimiter, chatLimiter, sensitiveLimiter } from './middleware/rateLimit';
 import { withLock } from './lib/withLock';
 
@@ -15,11 +16,14 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // Behind a reverse proxy (Render LB / Cloudflare / a VPS load balancer),
-// Express must trust upstream headers so req.ip / rate limiter IPs come from
-// X-Forwarded-For / CF-Connecting-IP instead of treating everyone as the
-// proxy's IP. Trust all hops: the Mongo-backed rate limiter then keys on the
-// real client IP forwarded through the Worker's CF-Connecting-IP header.
-app.set('trust proxy', true);
+// Express must trust upstream headers so req.ip / rate-limiter IPs come from
+// X-Forwarded-For instead of treating everyone as the proxy's IP.
+// ONLY the closest hop (1) is trusted — trusting every hop lets a client that
+// can reach us directly spoof arbitrary X-Forwarded-For values and rewrite its
+// own rate-limit key. The Cloudflare Worker also forwards CF-Connecting-IP
+// (set by Cloudflare at the edge, not spoofable by the caller), which the rate
+// limiter prefers (see rateLimit.ts).
+app.set('trust proxy', 1);
 
 // Security headers.
 app.use(helmet());
@@ -172,24 +176,57 @@ async function waitForDatabase(): Promise<void> {
 // Pulls fresh listings from external APIs/RSS, closes expired deadlines, and
 // embeds new/changed opportunities into Pinecone immediately.
 // Wrapped in a distributed lock so overlapping instances/retries never run in parallel.
+//
+// After every successful sync (boot or cron) we ALSO refresh every user's saved
+// CV matches against the freshly-updated feed, so the "Filter by CV" feed on the
+// dashboard stays current without any user action — this is the CV filter's
+// automatic daily update. A belt-and-braces midday cron runs the CV refresh even
+// on days the opportunity sync finds nothing new (e.g. deadlines flipping status).
+const runSyncAndRefresh = async () => {
+  const result = await withLock('opportunity-sync', 45 * 60 * 1000, runOpportunitySync);
+  if (result) {
+    console.log('[sync] Sync complete:', JSON.stringify(result));
+    try {
+      await withLock('cv-match-refresh', 30 * 60 * 1000, refreshCvMatches);
+    } catch (error) {
+      console.error('[sync] CV match refresh after sync failed:', error);
+    }
+  }
+  return result;
+};
+
 const scheduleOpportunitySync = () => {
   const cronExpression = process.env.SYNC_CRON || '0 6 * * *'; // default: daily 06:00
+  const cvRefreshCron = process.env.CV_REFRESH_CRON || '0 12 * * *'; // default: daily 12:00
   const timezone = process.env.SYNC_TIMEZONE || 'Africa/Lagos';
 
   console.log(`Scheduling opportunity sync: ${cronExpression} (${timezone})`);
   cron.schedule(cronExpression, async () => {
     console.log('[sync] Starting scheduled opportunity sync...');
     try {
-      const result = await withLock('opportunity-sync', 45 * 60 * 1000, runOpportunitySync);
-      if (result) console.log('[sync] Scheduled sync complete:', JSON.stringify(result));
+      await runSyncAndRefresh();
     } catch (error) {
       console.error('[sync] Scheduled sync failed:', error);
     }
   });
 
-  // Kick off an initial sync right after boot so the feed is fresh immediately.
-  console.log('[sync] Running initial opportunity sync at boot...');
-  withLock('opportunity-sync', 45 * 60 * 1000, runOpportunitySync)
+  // Independent daily CV refresh (in case the opportunity sync finds nothing
+  // new / is skipped by its lock — matches can still drift as deadlines close).
+  console.log(`Scheduling CV match refresh: ${cvRefreshCron} (${timezone})`);
+  cron.schedule(cvRefreshCron, async () => {
+    console.log('[cv-refresh] Starting scheduled CV match refresh...');
+    try {
+      const result = await withLock('cv-match-refresh', 30 * 60 * 1000, refreshCvMatches);
+      if (result) console.log('[cv-refresh] Complete:', JSON.stringify(result));
+    } catch (error) {
+      console.error('[cv-refresh] Scheduled refresh failed:', error);
+    }
+  });
+
+  // Kick off an initial sync + CV refresh right after boot so the feed (and CV
+  // matches) are current immediately.
+  console.log('[sync] Running initial sync at boot...');
+  runSyncAndRefresh()
     .then(result => result && console.log('[sync] Initial sync complete:', JSON.stringify(result)))
     .catch(error => console.error('[sync] Initial sync failed:', error));
 };

@@ -10,6 +10,16 @@ const ADMIN_UIDS = new Set(
     .filter(Boolean)
 );
 
+// Accept only https (or empty) avatar URLs, capped to a sane size. Prevents
+// javascript:/data: URLs or megabyte strings from being persisted and later
+// rendered as an <img src> or dumped into DB/admin pages (A-08).
+const sanitizePhotoUrl = (value: unknown): string => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^https:\/\/.+/i.test(raw) && raw.length <= 2048) return raw;
+  return '';
+};
+
 // Upsert the Firebase identity into the app-user registry on login. Nobody is
 // ever auto-promoted (not even the first user): admin is granted only to UIDs
 // listed in ADMIN_UIDS, so there is no race where a random early signup owns
@@ -26,8 +36,8 @@ export const syncUser = async (req: Request, res: Response) => {
       {
         $set: {
           email: String(email || ''),
-          displayName: String(displayName || ''),
-          photoURL: String(photoURL || ''),
+          displayName: String(displayName || '').slice(0, 120),
+          photoURL: sanitizePhotoUrl(photoURL),
         },
         $setOnInsert: { role },
       },

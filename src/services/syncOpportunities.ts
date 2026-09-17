@@ -201,12 +201,18 @@ export const runOpportunitySync = async (): Promise<SyncResult> => {
 
   // Sweep: anything already in the DB whose deadline has now passed gets closed
   // and removed from Pinecone (covers non-source records like the initial seed).
-  const sweepCandidates = await Opportunity.find({
+  // Lean projection + a cursor keeps the sweep O(1) rows in memory regardless
+  // of catalog size (avoids loading every listing's full document at once).
+  const sweepCursor = Opportunity.find({
     status: { $ne: 'CLOSED' },
     deadline: { $nin: [null, ''] },
-  });
+  })
+    .sort({ _id: 1 })
+    .select('_id status deadline')
+    .lean()
+    .cursor();
 
-  for (const doc of sweepCandidates) {
+  for await (const doc of sweepCursor) {
     const deadlineIso = toIsoDeadline(doc.deadline);
     if (!deadlineIso) continue;
 

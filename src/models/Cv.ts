@@ -16,7 +16,6 @@ export interface ICv extends Document {
   // re-analysis skips the delete/embed/upsert cycle entirely.
   vectorTextHash?: string;
   text: string;
-  analysis: string;
   matchIds: mongoose.Types.ObjectId[];
   createdAt: Date;
   updatedAt: Date;
@@ -34,7 +33,6 @@ const CvSchema: Schema = new Schema(
     cloudinaryUrl: { type: String },
     vectorTextHash: { type: String },
     text: { type: String },
-    analysis: { type: String },
     matchIds: [{ type: Schema.Types.ObjectId, ref: 'Opportunity' }],
   },
   { timestamps: true }

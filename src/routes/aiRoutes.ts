@@ -2,7 +2,6 @@ import express from 'express';
 import multer from 'multer';
 import {
   analyzeCV,
-  reanalyzeCV,
   getMyCVs,
   downloadCV,
   deleteCV,
@@ -39,7 +38,6 @@ const upload = multer({
 // analyzer is the most expensive route (PDF parse + embed + Pinecone + LLM),
 // so it gets its own aggressive limiter before any file is processed.
 router.post('/analyze-cv', cvAnalyzeLimiter, requireAuth, upload.single('cv'), analyzeCV);
-router.post('/reanalyze-cv', cvAnalyzeLimiter, requireAuth, reanalyzeCV);
 router.get('/my-cvs', requireAuth, getMyCVs);
 router.get('/cv/:cvId/download', requireAuth, downloadCV);
 router.delete('/cv/:cvId', requireAuth, deleteCV);

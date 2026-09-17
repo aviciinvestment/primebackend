@@ -26,7 +26,7 @@ router.post('/run', requireAdmin, async (_req, res) => {
     res.json({ success: true, result });
   } catch (error: any) {
     console.error('Manual sync failed:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'Sync failed.' });
   }
 });
 

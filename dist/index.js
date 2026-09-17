@@ -452,8 +452,7 @@ var getOpportunities = async (req, res) => {
     console.error("Error fetching opportunities:", error);
     res.status(500).json({
       success: false,
-      message: "Server Error",
-      error: error.message
+      message: "Server Error"
     });
   }
 };
@@ -514,7 +513,7 @@ var createManualOpportunity = async (req, res) => {
     res.status(201).json({ success: true, data: doc });
   } catch (error) {
     console.error("Error creating manual opportunity:", error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: "Failed to create the opportunity." });
   }
 };
 var getOpportunity = async (req, res) => {
@@ -1163,11 +1162,11 @@ var runOpportunitySync = async () => {
       }
     }
   }
-  const sweepCandidates = await Opportunity_default.find({
+  const sweepCursor = Opportunity_default.find({
     status: { $ne: "CLOSED" },
     deadline: { $nin: [null, ""] }
-  });
-  for (const doc of sweepCandidates) {
+  }).sort({ _id: 1 }).select("_id status deadline").lean().cursor();
+  for await (const doc of sweepCursor) {
     const deadlineIso = toIsoDeadline(doc.deadline);
     if (!deadlineIso) continue;
     const newStatus = computeStatus(deadlineIso);
@@ -1396,384 +1395,17 @@ var setWhatsappGroup = async (req, res) => {
   }
 };
 
-// src/middleware/rateLimit.ts
-var import_express_rate_limit = __toESM(require("express-rate-limit"));
-
-// src/middleware/mongoStore.ts
-var import_mongoose4 = require("mongoose");
-var RateLimitSchema = new import_mongoose4.Schema(
-  {
-    _id: { type: String, required: true },
-    counter: { type: Number, required: true, default: 0 },
-    expiresAt: { type: Date, required: true }
-  },
-  { versionKey: false }
-);
-var RateLimitModel = null;
-var getModel = () => {
-  if (!RateLimitModel) {
-    RateLimitModel = (0, import_mongoose4.model)("RateLimit", RateLimitSchema);
-    RateLimitModel.collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch((err) => console.error("[rate-limit] Could not create TTL index:", err));
-  }
-  return RateLimitModel;
-};
-var MongoStore = class {
-  localKeys = false;
-  windowMs;
-  constructor() {
-    this.windowMs = 60 * 1e3;
-  }
-  init(options) {
-    this.windowMs = options.windowMs || this.windowMs;
-  }
-  // Optional read path used by the middleware if it needs the current count.
-  async get(key) {
-    const doc = await getModel().findOne({ _id: key }).lean().exec();
-    if (!doc) return void 0;
-    return { totalHits: doc.counter, resetTime: new Date(doc.expiresAt) };
-  }
-  async increment(key) {
-    try {
-      const expiresAt = new Date(Date.now() + this.windowMs);
-      const doc = await getModel().findOneAndUpdate(
-        { _id: key },
-        { $inc: { counter: 1 }, $setOnInsert: { expiresAt } },
-        { upsert: true, new: true }
-      ).lean().exec();
-      return { totalHits: doc?.counter ?? 1, resetTime: new Date(doc?.expiresAt ?? expiresAt) };
-    } catch (err) {
-      console.error("[rate-limit] increment failed, failing open:", err);
-      return { totalHits: 0, resetTime: new Date(Date.now() + this.windowMs) };
-    }
-  }
-  async decrement(key) {
-    try {
-      await getModel().updateOne({ _id: key, counter: { $gt: 0 } }, { $inc: { counter: -1 } }).exec();
-    } catch (err) {
-      console.error("[rate-limit] decrement failed:", err);
-    }
-  }
-  async resetKey(key) {
-    try {
-      await getModel().deleteOne({ _id: key }).exec();
-    } catch (err) {
-      console.error("[rate-limit] resetKey failed:", err);
-    }
-  }
-};
-
-// src/middleware/rateLimit.ts
-var errorJson = (req, res) => {
-  res.status(429).json({ success: false, error: "Too many requests. Please try again shortly." });
-};
-var newMongoStore = () => new MongoStore();
-var windowMs = 60 * 1e3;
-var makeOptions = (name, limit, opts = {}) => ({
-  windowMs,
-  limit,
-  standardHeaders: true,
-  // Return rate limit info in `RateLimit-*` headers
-  legacyHeaders: false,
-  // Disable the `X-RateLimit-*` headers
-  handler: errorJson,
-  // req.ip is set by 'trust proxy' from the proxy chain; ipKeyGenerator
-  // normalizes IPv6 -> /56 subnet so limit keys don't collide per-address when
-  // the proxy forwards IPv6 clients. Prefix it so each limiter owns a disjoint
-  // key space in the shared Mongo collection.
-  keyGenerator: (req) => `${name}:${(0, import_express_rate_limit.ipKeyGenerator)(req.ip || req.socket.remoteAddress || "unknown")}`,
-  ...opts
-});
-var apiLimiter = (0, import_express_rate_limit.default)(
-  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("api", 120, { store: newMongoStore() }) : makeOptions("api", 120)
-);
-var strictLimiter = (0, import_express_rate_limit.default)(makeOptions("strict", 20, { store: newMongoStore() }));
-var chatLimiter = (0, import_express_rate_limit.default)(
-  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("chat", 20, { store: newMongoStore() }) : makeOptions("chat", 20)
-);
-var sensitiveLimiter = (0, import_express_rate_limit.default)(makeOptions("sensitive", 5, { store: newMongoStore() }));
-var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(makeOptions("cv", 5, { store: newMongoStore() }));
-var waitlistLimiter = (0, import_express_rate_limit.default)(
-  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("waitlist", 5, { store: newMongoStore() }) : makeOptions("waitlist", 5)
-);
-
-// src/lib/withLock.ts
-var import_mongoose5 = __toESM(require("mongoose"));
-var SyncLockSchema = new import_mongoose5.Schema(
-  {
-    _id: { type: String, required: true },
-    // lock name
-    acquiredAt: { type: Date, required: true },
-    expiresAt: { type: Date, required: true },
-    owner: { type: String, required: true }
-  },
-  { versionKey: false }
-);
-var SyncLock = import_mongoose5.default.models.SyncLock || import_mongoose5.default.model("SyncLock", SyncLockSchema);
-var acquire = async (name, ttlMs, owner) => {
-  const now = /* @__PURE__ */ new Date();
-  const result = await SyncLock.findOneAndUpdate(
-    {
-      _id: name,
-      $or: [{ expiresAt: { $lt: now } }, { expiresAt: { $exists: false } }]
-    },
-    { _id: name, acquiredAt: now, expiresAt: new Date(now.getTime() + ttlMs), owner },
-    { upsert: true, new: true }
-  );
-  return result?.owner === owner;
-};
-var withLock = async (name, ttlMs, fn) => {
-  const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const held = await acquire(name, ttlMs, owner);
-  if (!held) {
-    console.log(`[lock] "${name}" is held by another run \u2014 skipping.`);
-    return null;
-  }
-  try {
-    return await fn();
-  } finally {
-    await SyncLock.deleteOne({ _id: name, owner }).catch(() => {
-    });
-  }
-};
-
-// src/routes/opportunityRoutes.ts
-var import_express3 = __toESM(require("express"));
-
-// src/controllers/socialPreviewController.ts
-var FRONTEND_URL = (process.env.FRONTEND_URL || "https://prime-ed.vercel.app").replace(/\/+$/, "");
-var BRAND_OG_IMAGE = `${FRONTEND_URL}/prime-logo.png`;
-var escapeHtml = (value) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-var truncate = (text, max) => {
-  const trimmed = (text || "").trim().replace(/\s+/g, " ");
-  if (trimmed.length <= max) return trimmed;
-  return `${trimmed.slice(0, max - 1).trimEnd()}\u2026`;
-};
-var cleanLevel = (level) => level.replace(/^Category\s+[A-Z]\s*[-–—]?\s*/i, "").replace(/\s*[-–—]\s*.*$/i, "").trim() || level.trim();
-var joinList = (items, limit = 3, clean) => {
-  if (!items || items.length === 0) return "";
-  const kept = items.slice(0, limit).map((item) => clean ? clean(item) : item.trim()).filter(Boolean);
-  const suffix = items.length > limit ? ` & ${items.length - limit} more` : "";
-  return `${kept.join(", ")}${suffix}`;
-};
-var formatDeadline = (deadline) => {
-  if (!deadline) return "";
-  const date = new Date(deadline);
-  if (isNaN(date.getTime())) return deadline;
-  return date.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
-};
-var buildDescription = (opp) => {
-  const parts = [];
-  if (opp.eligibleEducationLevels?.length) {
-    parts.push(`Open to ${joinList(opp.eligibleEducationLevels, 3, cleanLevel)}`);
-  }
-  if (opp.eligibleFields?.length) {
-    parts.push(`Fields: ${joinList(opp.eligibleFields, 3)}`);
-  }
-  if (opp.deadline) {
-    parts.push(`Apply by ${formatDeadline(opp.deadline)}`);
-  }
-  if (opp.fundingAmount) {
-    parts.push(`Funding: ${opp.fundingAmount}${opp.currency ? ` ${opp.currency}` : ""}`);
-  }
-  const sentence = parts.join(". ");
-  if (sentence.length > 2) return truncate(`${sentence}.`, 200);
-  return truncate(opp.description || "A new opportunity added on Prime Opportunity.", 200);
-};
-var buildShareHtml = (opts) => {
-  const { appLink, ogTitle, ogDescription, ogImage, status } = opts;
-  const o = (value) => escapeHtml(value);
-  const statusBadge = status ? `<meta property="og:status" content="${o(status)}">` : "";
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${o(ogTitle)}</title>
-<meta name="description" content="${o(ogDescription)}">
-<meta name="robots" content="noindex,follow">
-<link rel="canonical" href="${o(appLink)}">
-<meta http-equiv="refresh" content="0; url=${o(appLink)}">
-<meta property="og:type" content="website">
-<meta property="og:url" content="${o(appLink)}">
-<meta property="og:title" content="${o(ogTitle)}">
-<meta property="og:description" content="${o(ogDescription)}">
-<meta property="og:image" content="${o(ogImage)}">
-<meta property="og:site_name" content="Prime Opportunity">
-${statusBadge}
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${o(ogTitle)}">
-<meta name="twitter:description" content="${o(ogDescription)}">
-<meta name="twitter:image" content="${o(ogImage)}">
-<meta name="theme-color" content="#0a0f16">
-</head>
-<body>
-<p>Opening <a href="${o(appLink)}">${o(ogTitle)}</a>\u2026</p>
-</body>
-</html>
-`;
-};
-var buildNotFoundHtml = () => {
-  const appRoot = FRONTEND_URL;
-  const ogTitle = "Opportunity Not Found";
-  const ogDescription = "This opportunity is no longer available on Prime Opportunity.";
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>${ogTitle}</title>
-<meta name="description" content="${ogDescription}">
-<meta name="robots" content="noindex,follow">
-<meta http-equiv="refresh" content="0; url=${escapeHtml(appRoot)}">
-<meta property="og:type" content="website">
-<meta property="og:url" content="${escapeHtml(appRoot)}">
-<meta property="og:title" content="${ogTitle}">
-<meta property="og:description" content="${ogDescription}">
-<meta property="og:site_name" content="Prime Opportunity">
-<meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="${ogTitle}">
-<meta name="twitter:description" content="${ogDescription}">
-<meta name="theme-color" content="#0a0f16">
-</head>
-<body>
-<p><a href="${escapeHtml(appRoot)}">Back to Prime Opportunity</a></p>
-</body>
-</html>
-`;
-};
-var getSharePreview = async (req, res) => {
-  const id = req.params.id || (typeof req.query.id === "string" ? req.query.id : "");
-  if (!/^[a-f0-9]{24}$/i.test(id)) {
-    res.status(404).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildNotFoundHtml());
-    return;
-  }
-  let opp = null;
-  try {
-    opp = await Opportunity_default.findById(id).select(
-      "title organization description eligibleEducationLevels eligibleFields deadline fundingAmount currency status"
-    ).lean();
-  } catch {
-    opp = null;
-  }
-  if (!opp) {
-    res.status(404).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildNotFoundHtml());
-    return;
-  }
-  const appLink = `${FRONTEND_URL}/opportunities?id=${id}`;
-  const ogTitle = truncate(`${opp.title || "Opportunity"}${opp.organization ? ` \xB7 ${opp.organization}` : ""}`, 70);
-  const ogDescription = buildDescription(opp);
-  const ogImage = BRAND_OG_IMAGE;
-  res.status(200).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildShareHtml({ appLink, ogTitle, ogDescription, ogImage, status: opp.status }));
-};
-
-// src/lib/firebaseAdmin.ts
-var import_app = require("firebase-admin/app");
-var import_auth = require("firebase-admin/auth");
-var FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "primeopportunity-18381";
-var app = null;
-var initFirebaseAdmin = () => {
-  if (!app) {
-    app = (0, import_app.getApps)()[0] || (0, import_app.initializeApp)({ projectId: FIREBASE_PROJECT_ID });
-  }
-  return app;
-};
-var getAdminAuth = () => {
-  initFirebaseAdmin();
-  return (0, import_auth.getAuth)();
-};
-
-// src/models/AppUser.ts
-var import_mongoose6 = __toESM(require("mongoose"));
-var AppUserSchema = new import_mongoose6.Schema(
-  {
-    uid: { type: String, required: true, unique: true, index: true },
-    email: { type: String, trim: true, lowercase: true },
-    displayName: { type: String, trim: true },
-    photoURL: { type: String },
-    role: { type: String, enum: ["user", "admin"], default: "user" },
-    mentorshipInterest: {
-      choice: { type: String, enum: ["yes", "no", null], default: null },
-      source: { type: String, enum: ["opportunity", "general"], default: "general" },
-      opportunityTitle: { type: String, default: "" },
-      opportunityUrl: { type: String, default: "" },
-      answeredAt: { type: Date }
-    }
-  },
-  { timestamps: true }
-);
-var AppUser_default = import_mongoose6.default.model("AppUser", AppUserSchema);
-
-// src/middleware/auth.ts
-var BEARER_RE = /^Bearer\s+(.+)$/i;
-var verifyToken = async (req) => {
-  const header = req.headers.authorization || "";
-  const match = BEARER_RE.exec(header);
-  if (!match?.[1]) {
-    const err = new Error("Authentication required.");
-    err.status = 401;
-    throw err;
-  }
-  const decoded = await getAdminAuth().verifyIdToken(match[1].trim());
-  return {
-    uid: decoded.uid,
-    email: decoded.email || null,
-    emailVerified: !!decoded.email_verified
-  };
-};
-var requireAuth = async (req, res, next) => {
-  try {
-    req.authUser = await verifyToken(req);
-    if (!req.authUser.emailVerified) {
-      const user = await AppUser_default.findOne({ uid: req.authUser.uid }).select("role").lean();
-      if (!user || user.role !== "admin") {
-        return res.status(403).json({
-          success: false,
-          code: "EMAIL_NOT_VERIFIED",
-          error: "Please verify your email before continuing."
-        });
-      }
-    }
-    return next();
-  } catch (error) {
-    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
-  }
-};
-var requireAdmin = async (req, res, next) => {
-  try {
-    req.authUser = await verifyToken(req);
-    const user = await AppUser_default.findOne({ uid: req.authUser.uid }).lean();
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, error: "Admin access only." });
-    }
-    return next();
-  } catch (error) {
-    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
-  }
-};
-
-// src/routes/opportunityRoutes.ts
-var router = import_express3.default.Router();
-router.get("/", getOpportunities);
-router.get("/share", getSharePreview);
-router.get("/:id", getOpportunity);
-router.get("/:id/share", getSharePreview);
-router.post("/", requireAdmin, createManualOpportunity);
-var opportunityRoutes_default = router;
-
-// src/routes/aiRoutes.ts
-var import_express5 = __toESM(require("express"));
-var import_multer = __toESM(require("multer"));
-
 // src/controllers/aiController.ts
-var import_express4 = require("express");
+var import_express3 = require("express");
 var import_crypto2 = require("crypto");
-var import_mongoose10 = require("mongoose");
+var import_mongoose7 = require("mongoose");
 var import_pdf_parse = __toESM(require("pdf-parse"));
 var import_pinecone2 = require("@pinecone-database/pinecone");
 var import_openai2 = __toESM(require("openai"));
 
 // src/models/Cv.ts
-var import_mongoose7 = __toESM(require("mongoose"));
-var CvSchema = new import_mongoose7.Schema(
+var import_mongoose4 = __toESM(require("mongoose"));
+var CvSchema = new import_mongoose4.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String },
@@ -1785,17 +1417,16 @@ var CvSchema = new import_mongoose7.Schema(
     cloudinaryUrl: { type: String },
     vectorTextHash: { type: String },
     text: { type: String },
-    analysis: { type: String },
-    matchIds: [{ type: import_mongoose7.Schema.Types.ObjectId, ref: "Opportunity" }]
+    matchIds: [{ type: import_mongoose4.Schema.Types.ObjectId, ref: "Opportunity" }]
   },
   { timestamps: true }
 );
 CvSchema.index({ userId: 1, createdAt: -1 });
-var Cv_default = import_mongoose7.default.model("Cv", CvSchema);
+var Cv_default = import_mongoose4.default.model("Cv", CvSchema);
 
 // src/models/Mentorship.ts
-var import_mongoose8 = __toESM(require("mongoose"));
-var MentorshipSchema = new import_mongoose8.Schema(
+var import_mongoose5 = __toESM(require("mongoose"));
+var MentorshipSchema = new import_mongoose5.Schema(
   {
     userId: { type: String, required: true, index: true },
     userEmail: { type: String, trim: true, lowercase: true },
@@ -1820,11 +1451,11 @@ var MentorshipSchema = new import_mongoose8.Schema(
 MentorshipSchema.index({ status: 1 });
 MentorshipSchema.index({ status: 1, mentorId: 1 });
 MentorshipSchema.index({ mentorId: 1, status: 1 });
-var Mentorship_default = import_mongoose8.default.model("Mentorship", MentorshipSchema);
+var Mentorship_default = import_mongoose5.default.model("Mentorship", MentorshipSchema);
 
 // src/models/MentorshipComplaint.ts
-var import_mongoose9 = __toESM(require("mongoose"));
-var MentorshipComplaintSchema = new import_mongoose9.Schema(
+var import_mongoose6 = __toESM(require("mongoose"));
+var MentorshipComplaintSchema = new import_mongoose6.Schema(
   {
     ticket: { type: String, required: true, unique: true },
     userId: { type: String, required: true, index: true },
@@ -1848,7 +1479,7 @@ var MentorshipComplaintSchema = new import_mongoose9.Schema(
   { timestamps: true }
 );
 MentorshipComplaintSchema.index({ status: 1, createdAt: -1 });
-var MentorshipComplaint_default = import_mongoose9.default.model("MentorshipComplaint", MentorshipComplaintSchema);
+var MentorshipComplaint_default = import_mongoose6.default.model("MentorshipComplaint", MentorshipComplaintSchema);
 
 // src/lib/cache.ts
 var LRUCache = class {
@@ -2071,39 +1702,63 @@ var nvidiaChatClient2 = new import_openai2.default({
   maxRetries: 1
 });
 var LLM_ATTEMPT_TIMEOUT_MS = 3e4;
-var CV_ANALYSIS_MODEL = "meta/muse-glimmer-30b";
-var CV_ANALYSIS_TIMEOUT_MS = 2e4;
-var CV_MAX_TOKENS = 1024;
-var MAX_INFLIGHT_LLM = 5;
+var CV_TEXT_MAX_CHARS = 2e4;
+var MAX_INFLIGHT_LLM = Math.min(
+  Math.max(parseInt(process.env.LLM_MAX_INFLIGHT || "5", 10) || 5, 1),
+  20
+);
+var LLM_SLOT_WAIT_MS = Math.min(
+  Math.max(parseInt(process.env.LLM_SLOT_WAIT_MS || "15000", 10) || 15e3, 1e3),
+  12e4
+);
+var CHAT_WALL_CLOCK_MS = Math.min(
+  Math.max(parseInt(process.env.CHAT_WALL_CLOCK_MS || "60000", 10) || 6e4, 5e3),
+  18e4
+);
 var inflightLlm = 0;
 var llmWaiters = [];
-var acquireLlm = async () => {
-  while (inflightLlm >= MAX_INFLIGHT_LLM) {
-    await new Promise((resolve) => {
-      llmWaiters.push(resolve);
-    });
+var LlmBusyError = class extends Error {
+  constructor() {
+    super("Too many concurrent AI requests at the moment.");
+    this.name = "LlmBusyError";
   }
-  inflightLlm += 1;
 };
+var waitForLlmSlot = (timeoutMs) => new Promise((resolve) => {
+  if (inflightLlm < MAX_INFLIGHT_LLM) {
+    inflightLlm += 1;
+    resolve(true);
+    return;
+  }
+  let timer;
+  const entry = () => {
+    if (inflightLlm < MAX_INFLIGHT_LLM) {
+      inflightLlm += 1;
+      if (timer !== void 0) clearTimeout(timer);
+      resolve(true);
+    }
+  };
+  llmWaiters.push(entry);
+  timer = setTimeout(() => {
+    const idx = llmWaiters.indexOf(entry);
+    if (idx >= 0) llmWaiters.splice(idx, 1);
+    resolve(false);
+  }, timeoutMs);
+});
 var releaseLlm = () => {
   inflightLlm -= 1;
   llmWaiters.shift()?.();
 };
-var withLlmSlot = async (fn) => {
-  await acquireLlm();
+var withLlmSlot = async (fn, timeoutMs = LLM_SLOT_WAIT_MS) => {
+  const acquired = await waitForLlmSlot(timeoutMs);
+  if (!acquired) throw new LlmBusyError();
   try {
     return await fn();
   } finally {
     releaseLlm();
   }
 };
-var chatModelAttempts = (opts = {}) => {
+var chatModelAttempts = () => {
   const attempts = [];
-  if (opts.few) {
-    attempts.push({ client: nvidiaChatClient, model: CV_ANALYSIS_MODEL });
-    attempts.push({ client: nvidiaChatClient2, model: CV_ANALYSIS_MODEL });
-    return attempts;
-  }
   const models = [
     "meta/muse-glimmer-30b",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
@@ -2130,12 +1785,14 @@ var describeLlmError = (err) => {
 };
 async function completeChat(messages, opts = {}) {
   const failures = [];
-  const attempts = chatModelAttempts({ few: opts.few });
-  const perAttemptTimeout = opts.timeoutMs ?? LLM_ATTEMPT_TIMEOUT_MS;
-  const rounds = opts.noRetry ? 1 : 2;
+  const startedAt = Date.now();
+  const deadline = startedAt + (opts.deadlineMs ?? CHAT_WALL_CLOCK_MS);
+  const attempts = chatModelAttempts();
   for (const attempt of attempts) {
+    if (Date.now() >= deadline) break;
     const { client, model: model2 } = attempt;
-    for (let round = 0; round < rounds; round++) {
+    for (let round = 0; round < 2; round++) {
+      if (Date.now() >= deadline) break;
       const retrying = round === 1;
       try {
         let content = "";
@@ -2158,7 +1815,7 @@ async function completeChat(messages, opts = {}) {
             // muse, an explicit validation error for nemotron), which made every
             // model fail. As the second SDK argument they abort the attempt and are
             // never serialized into the payload.
-            { timeout: perAttemptTimeout, maxRetries: 0 }
+            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
           );
           for await (const chunk of completion) {
             const delta = chunk.choices?.[0]?.delta?.content;
@@ -2169,21 +1826,14 @@ async function completeChat(messages, opts = {}) {
           console.log(`LLM OK via ${model2}`);
           return { content, model: model2 };
         }
-        if (!retrying) {
-          failures.push(`${model2} -> empty completion, retrying...`);
-          await new Promise((r) => setTimeout(r, 1500));
-          continue;
-        }
-        failures.push(`${model2} -> empty completion`);
+        failures.push(`${model2} -> empty completion${retrying ? "" : ", retrying..."}`);
+        if (!retrying) continue;
       } catch (err) {
+        if (err instanceof LlmBusyError) throw err;
         const detail = describeLlmError(err);
         const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
-        if (!retrying && soft && !opts.noRetry) {
-          failures.push(`${model2} -> ${detail}, retrying...`);
-          await new Promise((r) => setTimeout(r, 1500));
-          continue;
-        }
-        failures.push(`${model2} -> ${detail}`);
+        failures.push(`${model2} -> ${detail}${!retrying && soft ? ", retrying..." : ""}`);
+        if (!retrying && soft) continue;
         console.warn(`LLM model ${model2} failed: ${detail}`);
       }
       break;
@@ -2322,7 +1972,7 @@ var matchesEqual = (stored, current) => {
   const b = [...current].map((id) => String(id)).sort();
   return a.every((v, i) => v === b[i]);
 };
-async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }) {
+async function computeCvMatches({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }) {
   const truncatedCVText = cvText.substring(0, 4e3);
   const textHash = (0, import_crypto2.createHash)("sha256").update(cvText).digest("hex");
   const cvVector = await embedText(truncatedCVText);
@@ -2342,48 +1992,6 @@ async function runCvMatch({ cvText, userId, userEmail, userName, fileName, conte
       throw new Error("The saved CV no longer exists. Please upload a fresh PDF.");
     }
   }
-  let analysis = "";
-  if (existingCvId && cv.analysis && cv.text === cvText && matchesEqual(cv.matchIds, matchIds)) {
-    analysis = cv.analysis;
-    console.log(`CV analysis reused (matches unchanged) for userId=${userId}`);
-  } else if (!existingCvId) {
-    const prior = await Cv_default.findOne({ userId, text: cvText }).sort({ createdAt: -1 }).select("analysis matchIds").lean();
-    if (prior?.analysis && matchesEqual(prior.matchIds, matchIds)) {
-      analysis = prior.analysis;
-      console.log(`CV analysis reused (same text + matches as a previous upload) for userId=${userId}`);
-    }
-  }
-  if (!analysis) {
-    const oppsContext = sortedOpportunities.map(
-      (opp, index2) => `[${index2 + 1}] ${opp?.title} at ${opp?.organization}
-Category: ${opp?.category}
-Type: ${opp?.opportunityType}
-Location: ${opp?.location}
-Description: ${opp?.description}
-`
-    ).join("\n");
-    const prompt = `You are an expert career advisor.
-A user has uploaded their CV, and our semantic search engine has found the top matching opportunities from our database.
-Analyze the user's CV and explain why these specific opportunities are a great match for them. Highlight their strengths and suggest the best one to apply for.
-
-USER CV:
-${truncatedCVText}
-
-TOP MATCHING OPPORTUNITIES:
-${oppsContext}
-
-Provide a personalized, encouraging response to the user. Use markdown formatting. Keep it concise but highly valuable. Do not hallucinate opportunities that are not in the list.`;
-    try {
-      const result = await completeChat(
-        [{ role: "user", content: prompt }],
-        { temperature: 0.7, maxTokens: CV_MAX_TOKENS, few: true, noRetry: true, timeoutMs: CV_ANALYSIS_TIMEOUT_MS }
-      );
-      analysis = result.content;
-    } catch (llmErr) {
-      console.error("All LLM models failed during CV match:", llmErr);
-      analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable \u2014 try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || "unknown"})`;
-    }
-  }
   const needsSeed = !cv || cv.vectorTextHash !== textHash;
   if (existingCvId) {
     cv.userEmail = userEmail;
@@ -2396,7 +2004,6 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       cv.cloudinaryUrl = cloudinaryUrl || cv.cloudinaryUrl;
     }
     cv.text = cvText;
-    cv.analysis = analysis;
     cv.matchIds = sortedOpportunities.map((o) => o._id);
     cv.vectorTextHash = textHash;
   } else {
@@ -2409,7 +2016,6 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       ...fileData ? { fileData } : {},
       ...cloudinaryId ? { cloudinaryId, cloudinaryUrl } : {},
       text: cvText,
-      analysis,
       matchIds: sortedOpportunities.map((o) => o._id),
       vectorTextHash: textHash
     });
@@ -2442,7 +2048,7 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       }
     })();
   }
-  return { analysis, matches: sortedOpportunities, cvId: cv._id.toString() };
+  return { matches: sortedOpportunities, cvId: cv._id.toString() };
 }
 var analyzeCV = async (req, res) => {
   try {
@@ -2479,12 +2085,11 @@ var analyzeCV = async (req, res) => {
       console.error("PDF parsing failed:", pdfResult.error);
       res.status(400).json({
         success: false,
-        message: "Could not read this PDF. It may be password-protected or damaged \u2014 re-export it as a standard text PDF and try again.",
-        error: pdfResult.error?.message
+        message: "Could not read this PDF. It may be password-protected or damaged \u2014 re-export it as a standard text PDF and try again."
       });
       return;
     }
-    const cvText = (pdfResult.text || "").trim();
+    const cvText = (pdfResult.text || "").trim().slice(0, CV_TEXT_MAX_CHARS);
     if (!cvText) {
       res.status(400).json({ success: false, message: "Could not extract text from the provided PDF." });
       return;
@@ -2492,7 +2097,7 @@ var analyzeCV = async (req, res) => {
     const userId = req.authUser.uid;
     const cloudinaryId = cloudResult.ok ? cloudResult.cloudinaryId : void 0;
     const cloudinaryUrl = cloudResult.ok ? cloudResult.cloudinaryUrl : void 0;
-    const { analysis, matches, cvId } = await runCvMatch({
+    const { matches, cvId } = await computeCvMatches({
       cvText,
       userId,
       userEmail: req.authUser.email || "",
@@ -2504,46 +2109,12 @@ var analyzeCV = async (req, res) => {
       cloudinaryUrl,
       replaceSameFile: true
     });
-    res.json({ success: true, analysis, matches, cvId });
+    res.json({ success: true, matches, cvId });
   } catch (error) {
     console.error("Error analyzing CV:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to analyze CV.",
-      error: error.message
-    });
-  }
-};
-var reanalyzeCV = async (req, res) => {
-  try {
-    const userId = req.authUser.uid;
-    const latestCv = await Cv_default.findOne({ userId }).sort({ createdAt: -1 });
-    if (!latestCv) {
-      res.status(400).json({ success: false, message: "No saved CV found. Upload a CV first." });
-      return;
-    }
-    const cvText = (latestCv.text || "").trim();
-    if (!cvText) {
-      res.status(400).json({ success: false, message: "Saved CV has no extractable text. Upload a fresh PDF." });
-      return;
-    }
-    const { analysis, matches, cvId } = await runCvMatch({
-      cvText,
-      userId,
-      userEmail: req.authUser.email || latestCv.userEmail || "",
-      fileName: latestCv.fileName,
-      contentType: latestCv.contentType,
-      fileData: latestCv.fileData,
-      userName: req.body?.userName || latestCv.userName || "",
-      existingCvId: latestCv._id.toString()
-    });
-    res.json({ success: true, analysis, matches, cvId });
-  } catch (error) {
-    console.error("Error re-analyzing CV:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to re-analyze CV.",
-      error: error.message
+      message: "Failed to analyze CV."
     });
   }
 };
@@ -2683,9 +2254,11 @@ var chatWithAI = async (req, res) => {
     if (stream) {
       let reply2 = "";
       let streamed = false;
+      const chatDeadline = Date.now() + CHAT_WALL_CLOCK_MS;
       for (const attempt of chatModelAttempts()) {
-        if (abort.signal.aborted) break;
+        if (abort.signal.aborted || Date.now() >= chatDeadline) break;
         for (let round = 0; round < 2; round++) {
+          if (abort.signal.aborted || Date.now() >= chatDeadline) break;
           const retrying = round === 1;
           try {
             await withLlmSlot(async () => {
@@ -2700,7 +2273,7 @@ var chatWithAI = async (req, res) => {
                 },
                 // timeout/maxRetries/signal are request options — NVIDIA rejects
                 // them in the body ("Unsupported parameter(s): ...").
-                { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
+                { timeout: Math.min(LLM_ATTEMPT_TIMEOUT_MS, chatDeadline - Date.now()), maxRetries: 0, signal: abort.signal }
               );
               streamed = true;
               for await (const chunk of completion) {
@@ -2713,13 +2286,14 @@ var chatWithAI = async (req, res) => {
             });
             if (reply2.trim()) break;
           } catch (err) {
+            if (err instanceof LlmBusyError) {
+              writeSse({ type: "error", message: "The AI is busy right now \u2014 too many requests at once. Please try again in a moment." });
+              return res.end();
+            }
             const detail = describeLlmError(err);
             const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
-            console.warn(`Chat stream model ${attempt.model} failed: ${detail}${retrying ? "" : ", retrying..."}`);
-            if (!retrying && soft) {
-              await new Promise((r) => setTimeout(r, 1500));
-              continue;
-            }
+            console.warn(`Chat stream model ${attempt.model} failed: ${detail}${!retrying && soft ? ", retrying..." : ""}`);
+            if (!retrying && soft) continue;
           }
           break;
         }
@@ -2742,6 +2316,17 @@ var chatWithAI = async (req, res) => {
     aiReplyCache.set(cacheKey, { reply });
     res.json({ success: true, reply });
   } catch (error) {
+    if (error instanceof LlmBusyError) {
+      console.log("AI chat deferred: LLM slot queue full.");
+      if (res.headersSent && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: "error", message: "The AI is busy right now \u2014 too many requests at once. Please try again in a moment." })}
+
+`);
+        return res.end();
+      }
+      res.status(503).json({ success: false, message: "The AI is busy right now \u2014 too many requests at once. Please try again in a moment." });
+      return;
+    }
     console.error("Error in AI chat:", error);
     if (res.headersSent && !res.writableEnded) {
       res.write(`data: ${JSON.stringify({ type: "error", message: "Failed to process chat message." })}
@@ -2751,8 +2336,7 @@ var chatWithAI = async (req, res) => {
     }
     res.status(500).json({
       success: false,
-      message: "Failed to process chat message.",
-      error: error.message
+      message: "Failed to process chat message."
     });
   }
 };
@@ -2847,9 +2431,8 @@ var SKILL_KEYWORDS = [
   "Scrum"
 ];
 var escapeRegExp2 = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-var extractCvHighlights = (cvText, analysis = "") => {
-  const source = `${cvText}
-${analysis}`.toLowerCase();
+var extractCvHighlights = (cvText) => {
+  const source = cvText.toLowerCase();
   const roles = ROLE_KEYWORDS.filter(
     (kw) => new RegExp(escapeRegExp2(kw), "i").test(source)
   ).slice(0, 8);
@@ -2881,18 +2464,16 @@ var getMyCVs = async (req, res) => {
       cvs: cvs.map((cv) => ({
         _id: cv._id,
         fileName: cv.fileName,
-        analysis: cv.analysis,
         createdAt: cv.createdAt,
         matches: cv.matchIds,
-        highlights: extractCvHighlights(cv.text || "", cv.analysis || "")
+        highlights: extractCvHighlights(cv.text || "")
       }))
     });
   } catch (error) {
     console.error("Error fetching CVs:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to fetch CVs.",
-      error: error.message
+      message: "Failed to fetch CVs."
     });
   }
 };
@@ -2900,7 +2481,7 @@ var downloadCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose10.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose7.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -2909,23 +2490,41 @@ var downloadCV = async (req, res) => {
       res.status(404).json({ success: false, message: "CV not found." });
       return;
     }
-    if (cv.cloudinaryUrl) {
-      return res.redirect(302, cv.cloudinaryUrl);
-    }
     const safeName = (cv.fileName || "cv.pdf").replace(/[^\w.\- ]/g, "").replace(/"/g, "");
     res.setHeader("Content-Type", cv.contentType || "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${safeName || "cv.pdf"}"`);
+    if (cv.cloudinaryUrl) {
+      const upstream = await fetch(cv.cloudinaryUrl, { signal: AbortSignal.timeout(3e4) });
+      if (!upstream.ok || !upstream.body) {
+        throw new Error(`Cloudinary fetch failed (HTTP ${upstream.status}).`);
+      }
+      const contentLength = upstream.headers.get("Content-Length");
+      if (contentLength) res.setHeader("Content-Length", contentLength);
+      const reader = upstream.body.getReader();
+      for (; ; ) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) res.write(value);
+        if (res.writableEnded) break;
+      }
+      return res.end();
+    }
+    if (!cv.fileData) throw new Error("This CV has no stored file.");
     res.send(cv.fileData);
   } catch (error) {
     console.error("Error downloading CV:", error);
-    res.status(500).json({ success: false, message: "Failed to download CV." });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: "Failed to download CV." });
+    } else {
+      res.end();
+    }
   }
 };
 var deleteCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose10.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose7.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -2948,15 +2547,84 @@ var deleteCV = async (req, res) => {
     console.error("Error deleting CV:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to delete CV.",
-      error: error.message
+      message: "Failed to delete CV."
     });
   }
+};
+var refreshCvMatches = async () => {
+  const startedAt = Date.now();
+  let refreshed = 0;
+  let seeded = 0;
+  let failed = 0;
+  const latestByUser = await Cv_default.aggregate([
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: "$userId", doc: { $first: "$$ROOT" } } },
+    { $match: { "doc.text": { $exists: true, $ne: "" } } }
+  ]);
+  const docs = latestByUser.map((g) => g.doc).filter((d) => !!d && typeof d.text === "string");
+  const index = pinecone2.index(INDEX_NAME2);
+  const processDoc = async (doc) => {
+    const text = (doc.text || "").slice(0, 4e3);
+    const textHash = (0, import_crypto2.createHash)("sha256").update(doc.text || "").digest("hex");
+    try {
+      const vector = await embedText(text);
+      const queryResponse = await index.query({
+        vector,
+        topK: 5,
+        includeMetadata: true
+      });
+      const matchIds = queryResponse.matches.map((match) => match.id).filter((id) => /^[0-9a-fA-F]{24}$/.test(id));
+      const isObjectIdArray = Array.isArray(doc.matchIds);
+      if (!(isObjectIdArray && matchesEqual(doc.matchIds, matchIds))) {
+        await Cv_default.updateOne(
+          { _id: doc._id },
+          { $set: { matchIds: matchIds.map((id) => new import_mongoose7.Types.ObjectId(id)) } }
+        );
+        refreshed += 1;
+      }
+      if (doc.vectorTextHash !== textHash) {
+        await withNamespaceLock(
+          `${CV_NAMESPACE_PREFIX}${doc.userId}`,
+          () => seedUserCvVectors(doc.text || "", doc.userId, doc._id.toString(), doc.fileName || "cv.pdf")
+        );
+        await Cv_default.updateOne({ _id: doc._id }, { $set: { vectorTextHash: textHash } });
+        seeded += 1;
+      }
+    } catch (err) {
+      failed += 1;
+      console.error(`CV match refresh failed for userId=${doc.userId}:`, err);
+    }
+  };
+  const CONCURRENCY = Math.min(
+    4,
+    Math.max(1, parseInt(process.env.CV_REFRESH_CONCURRENCY || "4", 10) || 4)
+  );
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < docs.length) {
+      const doc = docs[cursor];
+      cursor += 1;
+      await processDoc(doc);
+    }
+  };
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  if (docs.length > 0) {
+    console.log(
+      `[cv-refresh] checked ${docs.length} user CVs: ${refreshed} refreshed, ${seeded} seeded, ${failed} failed in ${Date.now() - startedAt}ms`
+    );
+  }
+  return {
+    users: docs.length,
+    refreshed,
+    seeded,
+    failed,
+    durationMs: Date.now() - startedAt
+  };
 };
 var getRetrievedOpportunityContext = async (req, res) => {
   try {
     const rawIds = req.body?.ids;
-    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose10.isValidObjectId)(id)).slice(0, 8) : [];
+    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose7.isValidObjectId)(id)).slice(0, 8) : [];
     if (ids.length === 0) {
       return res.json({ success: true, context: null });
     }
@@ -2991,7 +2659,383 @@ var recordMentorshipComplaint = async (req, res) => {
   }
 };
 
+// src/middleware/rateLimit.ts
+var import_express_rate_limit = __toESM(require("express-rate-limit"));
+
+// src/middleware/mongoStore.ts
+var import_mongoose8 = require("mongoose");
+var RateLimitSchema = new import_mongoose8.Schema(
+  {
+    _id: { type: String, required: true },
+    counter: { type: Number, required: true, default: 0 },
+    expiresAt: { type: Date, required: true }
+  },
+  { versionKey: false }
+);
+var RateLimitModel = null;
+var getModel = () => {
+  if (!RateLimitModel) {
+    RateLimitModel = (0, import_mongoose8.model)("RateLimit", RateLimitSchema);
+    RateLimitModel.collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch((err) => console.error("[rate-limit] Could not create TTL index:", err));
+  }
+  return RateLimitModel;
+};
+var MongoStore = class {
+  localKeys = false;
+  windowMs;
+  constructor() {
+    this.windowMs = 60 * 1e3;
+  }
+  init(options) {
+    this.windowMs = options.windowMs || this.windowMs;
+  }
+  // Optional read path used by the middleware if it needs the current count.
+  async get(key) {
+    const doc = await getModel().findOne({ _id: key }).lean().exec();
+    if (!doc) return void 0;
+    return { totalHits: doc.counter, resetTime: new Date(doc.expiresAt) };
+  }
+  async increment(key) {
+    try {
+      const expiresAt = new Date(Date.now() + this.windowMs);
+      const doc = await getModel().findOneAndUpdate(
+        { _id: key },
+        { $inc: { counter: 1 }, $setOnInsert: { expiresAt } },
+        { upsert: true, new: true }
+      ).lean().exec();
+      return { totalHits: doc?.counter ?? 1, resetTime: new Date(doc?.expiresAt ?? expiresAt) };
+    } catch (err) {
+      console.error("[rate-limit] increment failed, failing open:", err);
+      return { totalHits: 0, resetTime: new Date(Date.now() + this.windowMs) };
+    }
+  }
+  async decrement(key) {
+    try {
+      await getModel().updateOne({ _id: key, counter: { $gt: 0 } }, { $inc: { counter: -1 } }).exec();
+    } catch (err) {
+      console.error("[rate-limit] decrement failed:", err);
+    }
+  }
+  async resetKey(key) {
+    try {
+      await getModel().deleteOne({ _id: key }).exec();
+    } catch (err) {
+      console.error("[rate-limit] resetKey failed:", err);
+    }
+  }
+};
+
+// src/middleware/rateLimit.ts
+var errorJson = (req, res) => {
+  res.status(429).json({ success: false, error: "Too many requests. Please try again shortly." });
+};
+var newMongoStore = () => new MongoStore();
+var windowMs = 60 * 1e3;
+var makeOptions = (name, limit, opts = {}) => ({
+  windowMs,
+  limit,
+  standardHeaders: true,
+  // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false,
+  // Disable the `X-RateLimit-*` headers
+  handler: errorJson,
+  // req.ip is set by 'trust proxy' (1 hop) from the proxy chain; ipKeyGenerator
+  // normalizes IPv6 -> /56 subnet so limit keys don't collide per-address when
+  // the proxy forwards IPv6 clients. Prefix it so each limiter owns a disjoint
+  // key space in the shared Mongo collection.
+  //
+  // CF-Connecting-IP is set by Cloudflare at the edge and cannot be spoofed by
+  // a caller, so requests that arrive THROUGH the Worker (chat context/complaint
+  // endpoints) get their true client IP keyed directly from it. Direct-to-Render
+  // requests have no such header and fall back to req.ip (trust proxy 1 already
+  // consumed the trusted hop). Prefer it over req.ip so the un-trusted-but-CF-set
+  // header wins where available.
+  keyGenerator: (req) => {
+    const cfIp = req.headers["cf-connecting-ip"] || "";
+    const ip = cfIp || req.ip || req.socket.remoteAddress || "unknown";
+    return `${name}:${(0, import_express_rate_limit.ipKeyGenerator)(ip)}`;
+  },
+  ...opts
+});
+var apiLimiter = (0, import_express_rate_limit.default)(
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("api", 120, { store: newMongoStore() }) : makeOptions("api", 120)
+);
+var strictLimiter = (0, import_express_rate_limit.default)(makeOptions("strict", 20, { store: newMongoStore() }));
+var chatLimiter = (0, import_express_rate_limit.default)(
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("chat", 20, { store: newMongoStore() }) : makeOptions("chat", 20)
+);
+var sensitiveLimiter = (0, import_express_rate_limit.default)(makeOptions("sensitive", 5, { store: newMongoStore() }));
+var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(makeOptions("cv", 5, { store: newMongoStore() }));
+var waitlistLimiter = (0, import_express_rate_limit.default)(
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("waitlist", 5, { store: newMongoStore() }) : makeOptions("waitlist", 5)
+);
+
+// src/lib/withLock.ts
+var import_mongoose9 = __toESM(require("mongoose"));
+var SyncLockSchema = new import_mongoose9.Schema(
+  {
+    _id: { type: String, required: true },
+    // lock name
+    acquiredAt: { type: Date, required: true },
+    expiresAt: { type: Date, required: true },
+    owner: { type: String, required: true }
+  },
+  { versionKey: false }
+);
+var SyncLock = import_mongoose9.default.models.SyncLock || import_mongoose9.default.model("SyncLock", SyncLockSchema);
+var acquire = async (name, ttlMs, owner) => {
+  const now = /* @__PURE__ */ new Date();
+  const result = await SyncLock.findOneAndUpdate(
+    {
+      _id: name,
+      $or: [{ expiresAt: { $lt: now } }, { expiresAt: { $exists: false } }]
+    },
+    { _id: name, acquiredAt: now, expiresAt: new Date(now.getTime() + ttlMs), owner },
+    { upsert: true, new: true }
+  );
+  return result?.owner === owner;
+};
+var withLock = async (name, ttlMs, fn) => {
+  const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const held = await acquire(name, ttlMs, owner);
+  if (!held) {
+    console.log(`[lock] "${name}" is held by another run \u2014 skipping.`);
+    return null;
+  }
+  try {
+    return await fn();
+  } finally {
+    await SyncLock.deleteOne({ _id: name, owner }).catch(() => {
+    });
+  }
+};
+
+// src/routes/opportunityRoutes.ts
+var import_express4 = __toESM(require("express"));
+
+// src/controllers/socialPreviewController.ts
+var FRONTEND_URL = (process.env.FRONTEND_URL || "https://prime-ed.vercel.app").replace(/\/+$/, "");
+var BRAND_OG_IMAGE = `${FRONTEND_URL}/prime-logo.png`;
+var escapeHtml = (value) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+var truncate = (text, max) => {
+  const trimmed = (text || "").trim().replace(/\s+/g, " ");
+  if (trimmed.length <= max) return trimmed;
+  return `${trimmed.slice(0, max - 1).trimEnd()}\u2026`;
+};
+var cleanLevel = (level) => level.replace(/^Category\s+[A-Z]\s*[-–—]?\s*/i, "").replace(/\s*[-–—]\s*.*$/i, "").trim() || level.trim();
+var joinList = (items, limit = 3, clean) => {
+  if (!items || items.length === 0) return "";
+  const kept = items.slice(0, limit).map((item) => clean ? clean(item) : item.trim()).filter(Boolean);
+  const suffix = items.length > limit ? ` & ${items.length - limit} more` : "";
+  return `${kept.join(", ")}${suffix}`;
+};
+var formatDeadline = (deadline) => {
+  if (!deadline) return "";
+  const date = new Date(deadline);
+  if (isNaN(date.getTime())) return deadline;
+  return date.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+};
+var buildDescription = (opp) => {
+  const parts = [];
+  if (opp.eligibleEducationLevels?.length) {
+    parts.push(`Open to ${joinList(opp.eligibleEducationLevels, 3, cleanLevel)}`);
+  }
+  if (opp.eligibleFields?.length) {
+    parts.push(`Fields: ${joinList(opp.eligibleFields, 3)}`);
+  }
+  if (opp.deadline) {
+    parts.push(`Apply by ${formatDeadline(opp.deadline)}`);
+  }
+  if (opp.fundingAmount) {
+    parts.push(`Funding: ${opp.fundingAmount}${opp.currency ? ` ${opp.currency}` : ""}`);
+  }
+  const sentence = parts.join(". ");
+  if (sentence.length > 2) return truncate(`${sentence}.`, 200);
+  return truncate(opp.description || "A new opportunity added on Prime Opportunity.", 200);
+};
+var buildShareHtml = (opts) => {
+  const { appLink, ogTitle, ogDescription, ogImage, status } = opts;
+  const o = (value) => escapeHtml(value);
+  const statusBadge = status ? `<meta property="og:status" content="${o(status)}">` : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${o(ogTitle)}</title>
+<meta name="description" content="${o(ogDescription)}">
+<meta name="robots" content="noindex,follow">
+<link rel="canonical" href="${o(appLink)}">
+<meta http-equiv="refresh" content="0; url=${o(appLink)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${o(appLink)}">
+<meta property="og:title" content="${o(ogTitle)}">
+<meta property="og:description" content="${o(ogDescription)}">
+<meta property="og:image" content="${o(ogImage)}">
+<meta property="og:site_name" content="Prime Opportunity">
+${statusBadge}
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${o(ogTitle)}">
+<meta name="twitter:description" content="${o(ogDescription)}">
+<meta name="twitter:image" content="${o(ogImage)}">
+<meta name="theme-color" content="#0a0f16">
+</head>
+<body>
+<p>Opening <a href="${o(appLink)}">${o(ogTitle)}</a>\u2026</p>
+</body>
+</html>
+`;
+};
+var buildNotFoundHtml = () => {
+  const appRoot = FRONTEND_URL;
+  const ogTitle = "Opportunity Not Found";
+  const ogDescription = "This opportunity is no longer available on Prime Opportunity.";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${ogTitle}</title>
+<meta name="description" content="${ogDescription}">
+<meta name="robots" content="noindex,follow">
+<meta http-equiv="refresh" content="0; url=${escapeHtml(appRoot)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${escapeHtml(appRoot)}">
+<meta property="og:title" content="${ogTitle}">
+<meta property="og:description" content="${ogDescription}">
+<meta property="og:site_name" content="Prime Opportunity">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${ogTitle}">
+<meta name="twitter:description" content="${ogDescription}">
+<meta name="theme-color" content="#0a0f16">
+</head>
+<body>
+<p><a href="${escapeHtml(appRoot)}">Back to Prime Opportunity</a></p>
+</body>
+</html>
+`;
+};
+var getSharePreview = async (req, res) => {
+  const id = req.params.id || (typeof req.query.id === "string" ? req.query.id : "");
+  if (!/^[a-f0-9]{24}$/i.test(id)) {
+    res.status(404).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildNotFoundHtml());
+    return;
+  }
+  let opp = null;
+  try {
+    opp = await Opportunity_default.findById(id).select(
+      "title organization description eligibleEducationLevels eligibleFields deadline fundingAmount currency status"
+    ).lean();
+  } catch {
+    opp = null;
+  }
+  if (!opp) {
+    res.status(404).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildNotFoundHtml());
+    return;
+  }
+  const appLink = `${FRONTEND_URL}/opportunities?id=${id}`;
+  const ogTitle = truncate(`${opp.title || "Opportunity"}${opp.organization ? ` \xB7 ${opp.organization}` : ""}`, 70);
+  const ogDescription = buildDescription(opp);
+  const ogImage = BRAND_OG_IMAGE;
+  res.status(200).set("Content-Type", "text/html; charset=utf-8").set("Cache-Control", "public, max-age=60, s-maxage=300").send(buildShareHtml({ appLink, ogTitle, ogDescription, ogImage, status: opp.status }));
+};
+
+// src/lib/firebaseAdmin.ts
+var import_app = require("firebase-admin/app");
+var import_auth = require("firebase-admin/auth");
+var FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "primeopportunity-18381";
+var app = null;
+var initFirebaseAdmin = () => {
+  if (!app) {
+    app = (0, import_app.getApps)()[0] || (0, import_app.initializeApp)({ projectId: FIREBASE_PROJECT_ID });
+  }
+  return app;
+};
+var getAdminAuth = () => {
+  initFirebaseAdmin();
+  return (0, import_auth.getAuth)();
+};
+
+// src/models/AppUser.ts
+var import_mongoose10 = __toESM(require("mongoose"));
+var AppUserSchema = new import_mongoose10.Schema(
+  {
+    uid: { type: String, required: true, unique: true, index: true },
+    email: { type: String, trim: true, lowercase: true },
+    displayName: { type: String, trim: true },
+    photoURL: { type: String },
+    role: { type: String, enum: ["user", "admin"], default: "user" },
+    mentorshipInterest: {
+      choice: { type: String, enum: ["yes", "no", null], default: null },
+      source: { type: String, enum: ["opportunity", "general"], default: "general" },
+      opportunityTitle: { type: String, default: "" },
+      opportunityUrl: { type: String, default: "" },
+      answeredAt: { type: Date }
+    }
+  },
+  { timestamps: true }
+);
+var AppUser_default = import_mongoose10.default.model("AppUser", AppUserSchema);
+
+// src/middleware/auth.ts
+var BEARER_RE = /^Bearer\s+(.+)$/i;
+var verifyToken = async (req) => {
+  const header = req.headers.authorization || "";
+  const match = BEARER_RE.exec(header);
+  if (!match?.[1]) {
+    const err = new Error("Authentication required.");
+    err.status = 401;
+    throw err;
+  }
+  const decoded = await getAdminAuth().verifyIdToken(match[1].trim());
+  return {
+    uid: decoded.uid,
+    email: decoded.email || null,
+    emailVerified: !!decoded.email_verified
+  };
+};
+var requireAuth = async (req, res, next) => {
+  try {
+    req.authUser = await verifyToken(req);
+    if (!req.authUser.emailVerified) {
+      const user = await AppUser_default.findOne({ uid: req.authUser.uid }).select("role").lean();
+      if (!user || user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          code: "EMAIL_NOT_VERIFIED",
+          error: "Please verify your email before continuing."
+        });
+      }
+    }
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
+  }
+};
+var requireAdmin = async (req, res, next) => {
+  try {
+    req.authUser = await verifyToken(req);
+    const user = await AppUser_default.findOne({ uid: req.authUser.uid }).lean();
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, error: "Admin access only." });
+    }
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({ success: false, error: error?.status === 401 ? "Authentication required." : "Invalid or expired session." });
+  }
+};
+
+// src/routes/opportunityRoutes.ts
+var router = import_express4.default.Router();
+router.get("/", getOpportunities);
+router.get("/share", getSharePreview);
+router.get("/:id", getOpportunity);
+router.get("/:id/share", getSharePreview);
+router.post("/", requireAdmin, createManualOpportunity);
+var opportunityRoutes_default = router;
+
 // src/routes/aiRoutes.ts
+var import_express5 = __toESM(require("express"));
+var import_multer = __toESM(require("multer"));
 var router2 = import_express5.default.Router();
 var storage = import_multer.default.memoryStorage();
 var upload = (0, import_multer.default)({
@@ -3013,7 +3057,6 @@ var upload = (0, import_multer.default)({
   }
 });
 router2.post("/analyze-cv", cvAnalyzeLimiter, requireAuth, upload.single("cv"), analyzeCV);
-router2.post("/reanalyze-cv", cvAnalyzeLimiter, requireAuth, reanalyzeCV);
 router2.get("/my-cvs", requireAuth, getMyCVs);
 router2.get("/cv/:cvId/download", requireAuth, downloadCV);
 router2.delete("/cv/:cvId", requireAuth, deleteCV);
@@ -3111,6 +3154,11 @@ var assignMentorToMentee = async (mentorship) => {
     text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t.length > 2)
   );
   const requestTokens = tokens(requestText);
+  const loadAgg = await Mentorship_default.aggregate([
+    { $match: { status: "paid", mentorId: { $ne: null } } },
+    { $group: { _id: "$mentorId", total: { $sum: 1 } } }
+  ]);
+  const loadByMentor = new Map(loadAgg.map((l) => [l._id, l.total]));
   const scored = [];
   for (const mentor of approved) {
     const mentorText = `${mentor.roleType} ${mentor.company} ${mentor.careerStory || ""}`;
@@ -3120,7 +3168,7 @@ var assignMentorToMentee = async (mentorship) => {
       if (mentorTokens.has(token)) score += 1;
     }
     if (score === 0) continue;
-    const load = await Mentorship_default.countDocuments({ mentorId: mentor.userId, status: "paid" });
+    const load = loadByMentor.get(mentor.userId) || 0;
     scored.push({ mentor, score, load });
   }
   if (scored.length === 0) return;
@@ -3208,7 +3256,7 @@ router4.post("/run", requireAdmin, async (_req, res) => {
     res.json({ success: true, result });
   } catch (error) {
     console.error("Manual sync failed:", error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: "Sync failed." });
   }
 });
 var syncRoutes_default = router4;
@@ -3261,7 +3309,7 @@ var getApplications = async (req, res) => {
     res.json({ success: true, count: apps.length, data: apps.map(populateApplication) });
   } catch (error) {
     console.error("Error fetching applications:", error);
-    res.status(500).json({ success: false, message: "Server Error", error: error.message });
+    res.status(500).json({ success: false, message: "Server Error" });
   }
 };
 var upsertApplication = async (req, res) => {
@@ -3314,7 +3362,7 @@ var upsertApplication = async (req, res) => {
     res.json({ success: true, data: populateApplication(populated) });
   } catch (error) {
     console.error("Error upserting application:", error);
-    res.status(500).json({ success: false, message: "Server Error", error: error.message });
+    res.status(500).json({ success: false, message: "Server Error" });
   }
 };
 
@@ -3437,6 +3485,12 @@ var import_express13 = require("express");
 var ADMIN_UIDS = new Set(
   (process.env.ADMIN_UIDS || "").split(",").map((s) => s.trim()).filter(Boolean)
 );
+var sanitizePhotoUrl = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^https:\/\/.+/i.test(raw) && raw.length <= 2048) return raw;
+  return "";
+};
 var syncUser = async (req, res) => {
   try {
     const uid = req.authUser.uid;
@@ -3447,8 +3501,8 @@ var syncUser = async (req, res) => {
       {
         $set: {
           email: String(email || ""),
-          displayName: String(displayName || ""),
-          photoURL: String(photoURL || "")
+          displayName: String(displayName || "").slice(0, 120),
+          photoURL: sanitizePhotoUrl(photoURL)
         },
         $setOnInsert: { role }
       },
@@ -3536,6 +3590,15 @@ var import_express16 = __toESM(require("express"));
 var import_express15 = require("express");
 var import_mongoose13 = require("mongoose");
 var PLATFORM_CUT = 0.1;
+var ADMIN_LIST_LIMIT = 100;
+var ADMIN_LIST_MAX_LIMIT = 200;
+var parsePagination = (req) => {
+  const rawPage = parseInt(String(req.query.page ?? ""), 10);
+  const rawLimit = parseInt(String(req.query.limit ?? ""), 10);
+  const page = Number.isFinite(rawPage) && rawPage >= 1 ? rawPage : 1;
+  const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, ADMIN_LIST_MAX_LIMIT) : ADMIN_LIST_LIMIT;
+  return { page, limit, skip: (page - 1) * limit };
+};
 var getOverview = async (_req, res) => {
   try {
     const [totalUsers, totalMentors, pendingMentorApplications, totalMentees, revenueAgg] = await Promise.all([
@@ -3566,9 +3629,13 @@ var getOverview = async (_req, res) => {
     res.status(500).json({ success: false, error: "Failed to load overview." });
   }
 };
-var listUsers = async (_req, res) => {
+var listUsers = async (req, res) => {
   try {
-    const users = await AppUser_default.find().sort({ createdAt: -1 }).lean();
+    const { page, limit, skip } = parsePagination(req);
+    const [users, total] = await Promise.all([
+      AppUser_default.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      AppUser_default.countDocuments()
+    ]);
     res.json({
       success: true,
       users: users.map((u) => ({
@@ -3579,16 +3646,23 @@ var listUsers = async (_req, res) => {
         role: u.role,
         createdAt: u.createdAt,
         mentorshipInterest: u.mentorshipInterest || null
-      }))
+      })),
+      total,
+      page,
+      pages: Math.ceil(total / limit)
     });
   } catch (error) {
     console.error("Failed to list users:", error);
     res.status(500).json({ success: false, error: "Failed to list users." });
   }
 };
-var listMentors = async (_req, res) => {
+var listMentors = async (req, res) => {
   try {
-    const mentors = await Mentor_default.find().sort({ createdAt: -1 }).lean();
+    const { page, limit, skip } = parsePagination(req);
+    const [mentors, total] = await Promise.all([
+      Mentor_default.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Mentor_default.countDocuments()
+    ]);
     const stats = await Mentorship_default.aggregate([
       { $match: { status: "paid", mentorId: { $ne: null } } },
       { $group: { _id: "$mentorId", total: { $sum: 1 }, gross: { $sum: { $ifNull: ["$amount", 0] } } } }
@@ -3611,15 +3685,19 @@ var listMentors = async (_req, res) => {
         createdAt: m.createdAt
       };
     });
-    res.json({ success: true, mentors: results });
+    res.json({ success: true, mentors: results, total, page, pages: Math.ceil(total / limit) });
   } catch (error) {
     console.error("Failed to list mentors:", error);
     res.status(500).json({ success: false, error: "Failed to list mentors." });
   }
 };
-var listMentees = async (_req, res) => {
+var listMentees = async (req, res) => {
   try {
-    const requests = await Mentorship_default.find({ status: "paid" }).sort({ createdAt: -1 }).lean();
+    const { page, limit, skip } = parsePagination(req);
+    const [requests, total] = await Promise.all([
+      Mentorship_default.find({ status: "paid" }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Mentorship_default.countDocuments({ status: "paid" })
+    ]);
     res.json({
       success: true,
       mentees: requests.map((r) => ({
@@ -3637,7 +3715,10 @@ var listMentees = async (_req, res) => {
         mentorCut: (r.amount || 0) * (1 - PLATFORM_CUT),
         reference: r.reference,
         createdAt: r.createdAt
-      }))
+      })),
+      total,
+      page,
+      pages: Math.ceil(total / limit)
     });
   } catch (error) {
     console.error("Failed to list mentees:", error);
@@ -3754,7 +3835,7 @@ var launchRoutes_default = router9;
 // src/index.ts
 var app2 = (0, import_express18.default)();
 var port = process.env.PORT || 5e3;
-app2.set("trust proxy", true);
+app2.set("trust proxy", 1);
 app2.use((0, import_helmet.default)());
 app2.use((0, import_compression.default)({
   filter: (req, res) => {
@@ -3836,21 +3917,43 @@ async function waitForDatabase() {
     }
   }
 }
+var runSyncAndRefresh = async () => {
+  const result = await withLock("opportunity-sync", 45 * 60 * 1e3, runOpportunitySync);
+  if (result) {
+    console.log("[sync] Sync complete:", JSON.stringify(result));
+    try {
+      await withLock("cv-match-refresh", 30 * 60 * 1e3, refreshCvMatches);
+    } catch (error) {
+      console.error("[sync] CV match refresh after sync failed:", error);
+    }
+  }
+  return result;
+};
 var scheduleOpportunitySync = () => {
   const cronExpression = process.env.SYNC_CRON || "0 6 * * *";
+  const cvRefreshCron = process.env.CV_REFRESH_CRON || "0 12 * * *";
   const timezone = process.env.SYNC_TIMEZONE || "Africa/Lagos";
   console.log(`Scheduling opportunity sync: ${cronExpression} (${timezone})`);
   import_node_cron.default.schedule(cronExpression, async () => {
     console.log("[sync] Starting scheduled opportunity sync...");
     try {
-      const result = await withLock("opportunity-sync", 45 * 60 * 1e3, runOpportunitySync);
-      if (result) console.log("[sync] Scheduled sync complete:", JSON.stringify(result));
+      await runSyncAndRefresh();
     } catch (error) {
       console.error("[sync] Scheduled sync failed:", error);
     }
   });
-  console.log("[sync] Running initial opportunity sync at boot...");
-  withLock("opportunity-sync", 45 * 60 * 1e3, runOpportunitySync).then((result) => result && console.log("[sync] Initial sync complete:", JSON.stringify(result))).catch((error) => console.error("[sync] Initial sync failed:", error));
+  console.log(`Scheduling CV match refresh: ${cvRefreshCron} (${timezone})`);
+  import_node_cron.default.schedule(cvRefreshCron, async () => {
+    console.log("[cv-refresh] Starting scheduled CV match refresh...");
+    try {
+      const result = await withLock("cv-match-refresh", 30 * 60 * 1e3, refreshCvMatches);
+      if (result) console.log("[cv-refresh] Complete:", JSON.stringify(result));
+    } catch (error) {
+      console.error("[cv-refresh] Scheduled refresh failed:", error);
+    }
+  });
+  console.log("[sync] Running initial sync at boot...");
+  runSyncAndRefresh().then((result) => result && console.log("[sync] Initial sync complete:", JSON.stringify(result))).catch((error) => console.error("[sync] Initial sync failed:", error));
 };
 var scheduleLaunchCheck = () => {
   import_node_cron.default.schedule("*/1 * * * *", async () => {

@@ -87,6 +87,14 @@ export const assignMentorToMentee = async (mentorship: any) => {
     );
   const requestTokens = tokens(requestText);
 
+  // One aggregate for every mentor's current paid-load instead of an N+1
+  // countDocuments per candidate (which scaled linearly with mentor count).
+  const loadAgg = await Mentorship.aggregate<{ _id: string; total: number }>([
+    { $match: { status: 'paid', mentorId: { $ne: null } } },
+    { $group: { _id: '$mentorId', total: { $sum: 1 } } },
+  ]);
+  const loadByMentor = new Map(loadAgg.map(l => [l._id, l.total]));
+
   const scored: Array<{ mentor: any; score: number; load: number }> = [];
   for (const mentor of approved) {
     const mentorText = `${mentor.roleType} ${mentor.company} ${mentor.careerStory || ''}`;
@@ -98,7 +106,7 @@ export const assignMentorToMentee = async (mentorship: any) => {
 
     if (score === 0) continue;
 
-    const load = await Mentorship.countDocuments({ mentorId: mentor.userId, status: 'paid' });
+    const load = loadByMentor.get(mentor.userId) || 0;
     scored.push({ mentor, score, load });
   }
 
