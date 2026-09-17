@@ -6,7 +6,11 @@ export interface ICv extends Document {
   userName?: string;
   fileName: string;
   contentType: string;
-  fileData: Buffer;
+  fileData?: Buffer;
+  // New uploads store the PDF on Cloudinary instead of inside Mongo; these
+  // references back it. Legacy docs keep fileData until replaced.
+  cloudinaryId?: string;
+  cloudinaryUrl?: string;
   text: string;
   analysis: string;
   matchIds: mongoose.Types.ObjectId[];
@@ -21,7 +25,9 @@ const CvSchema: Schema = new Schema(
     userName: { type: String },
     fileName: { type: String, required: true },
     contentType: { type: String, required: true },
-    fileData: { type: Buffer, required: true },
+    fileData: { type: Buffer },
+    cloudinaryId: { type: String },
+    cloudinaryUrl: { type: String },
     text: { type: String },
     analysis: { type: String },
     matchIds: [{ type: Schema.Types.ObjectId, ref: 'Opportunity' }],

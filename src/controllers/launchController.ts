@@ -8,6 +8,41 @@ const WELCOME_WINDOW_MS = 2 * DAY_MS; // welcome banner is shown for 2 days afte
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// The waitlist count is re-read at most once per COUNT_TTL_MS instead of on
+// every home-page load / join (countDocuments() walks the whole index each
+// call; caching it removes that repeat DB work under launch-day traffic).
+const COUNT_TTL_MS = 30_000;
+let cachedWaitlistCount = -1;
+let cachedWaitlistCountAt = 0;
+
+const getWaitlistCount = async (): Promise<number> => {
+  const now = Date.now();
+  if (cachedWaitlistCount >= 0 && now - cachedWaitlistCountAt < COUNT_TTL_MS) {
+    return cachedWaitlistCount;
+  }
+  cachedWaitlistCount = await WaitlistEntry.countDocuments();
+  cachedWaitlistCountAt = now;
+  return cachedWaitlistCount;
+};
+
+// Only known WhatsApp hosts are accepted so the stored link can never be an
+// open-redirect vector used by WaitlistSection's window.location redirect.
+const isAllowedWhatsappUrl = (raw: string): boolean => {
+  if (!/^https:\/\//i.test(raw)) return false;
+  let hostname: string;
+  try {
+    hostname = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    hostname === 'wa.me' ||
+    hostname === 'chat.whatsapp.com' ||
+    hostname === 'whatsapp.com' ||
+    hostname.endsWith('.whatsapp.com')
+  );
+};
+
 // Fetch the single launch config, seeding it with defaults on first access.
 const getConfig = async (): Promise<ILaunchConfig> => {
   let config = await LaunchConfig.findOne();
@@ -60,7 +95,8 @@ export const getLaunchStatus = async (_req: Request, res: Response) => {
   try {
     await autoLaunchIfDue();
     const config = await getConfig();
-    const waitlistCount = await WaitlistEntry.countDocuments();
+    const waitlistCount = await getWaitlistCount();
+    res.setHeader('Cache-Control', 'public, max-age=30');
     res.json({ success: true, ...toPublic(config), waitlistCount });
   } catch (error: any) {
     console.error('Failed to get launch status:', error);
@@ -85,7 +121,7 @@ export const joinWaitlist = async (req: Request, res: Response) => {
     );
 
     const config = await getConfig();
-    const waitlistCount = await WaitlistEntry.countDocuments();
+    const waitlistCount = await getWaitlistCount();
     res.json({
       success: true,
       waitlistCount,
@@ -169,8 +205,11 @@ export const setLaunchTimer = async (req: Request, res: Response) => {
 export const setWhatsappGroup = async (req: Request, res: Response) => {
   try {
     const url = String(req.body?.url || '').trim();
-    if (url && !/^https:\/\//i.test(url)) {
-      return res.status(400).json({ success: false, error: 'Only https:// links are allowed.' });
+    if (url && !isAllowedWhatsappUrl(url)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only https:// links to WhatsApp (whatsapp.com, wa.me, chat.whatsapp.com) are allowed.',
+      });
     }
     const config = await getConfig();
     config.whatsappGroupUrl = url;

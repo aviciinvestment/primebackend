@@ -49,6 +49,17 @@ export const apiLimiter = rateLimit(
 // Mongo store (low volume, survives restarts, catches repeat abusers).
 export const strictLimiter = rateLimit(makeOptions('strict', 20, { store: newMongoStore() }));
 
+// Chat is the highest-volume protected endpoint. It ALSO has its own per-user
+// token bucket in aiController (keyed on verified uid), so the IP ceiling here
+// is just a burst backstop. In-memory by default — the Mongo store's per-message
+// upsert write was pure DB overhead on a single instance. Set RATE_LIMIT_STORE
+// =mongo before scaling to multiple backend instances.
+export const chatLimiter = rateLimit(
+  process.env.RATE_LIMIT_STORE === 'mongo'
+    ? makeOptions('chat', 20, { store: newMongoStore() })
+    : makeOptions('chat', 20)
+);
+
 // Very tight limit for the manual sync trigger and legacy auth endpoints.
 export const sensitiveLimiter = rateLimit(makeOptions('sensitive', 5, { store: newMongoStore() }));
 
@@ -56,3 +67,11 @@ export const sensitiveLimiter = rateLimit(makeOptions('sensitive', 5, { store: n
 // embed + Pinecone query + LLM completion, so 5/min/IP bounds how quickly a
 // single client can drive CPU/memory spikes with large uploads.
 export const cvAnalyzeLimiter = rateLimit(makeOptions('cv', 5, { store: newMongoStore() }));
+
+// Public waitlist signup. The per-email upsert is already idempotent, so this
+// mainly stops a spam script hammering the DB writes and count query.
+export const waitlistLimiter = rateLimit(
+  process.env.RATE_LIMIT_STORE === 'mongo'
+    ? makeOptions('waitlist', 5, { store: newMongoStore() })
+    : makeOptions('waitlist', 5)
+);

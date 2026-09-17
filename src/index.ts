@@ -8,7 +8,7 @@ import helmet from 'helmet';
 import multer from 'multer';
 import { runOpportunitySync } from './services/syncOpportunities';
 import { autoLaunchIfDue } from './controllers/launchController';
-import { apiLimiter, sensitiveLimiter, strictLimiter } from './middleware/rateLimit';
+import { apiLimiter, chatLimiter, sensitiveLimiter } from './middleware/rateLimit';
 import { withLock } from './lib/withLock';
 
 const app = express();
@@ -26,7 +26,14 @@ app.use(helmet());
 
 // Gzip JSON responses (opportunity arrays are large). Runs early so the
 // compressed stream flows through the rest of the middleware unchanged.
-app.use(compression());
+// SSE chat streams are deliberately EXCLUDED: zlib buffering would delay tiny
+// 'data:' frames, so llamaChat streaming would not actually stream.
+app.use(compression({
+  filter: (req, res) => {
+    const contentType = String(res.getHeader('Content-Type') || '');
+    return !contentType.includes('text/event-stream') && compression.filter(req, res);
+  },
+}));
 
 // Strict CORS allow-list. Without CORS_ORIGIN we only permit the local dev
 // frontends; production origins go in CORS_ORIGIN (comma-separated), or * to
@@ -60,7 +67,9 @@ app.use(express.json({ limit: '1mb' }));
 
 // Global per-IP ceiling + tighter limits on expensive and abuse-prone routes.
 app.use('/api', apiLimiter);
-app.use('/api/ai/chat', strictLimiter);
+// Chat uses the in-memory limiter (per-user burst control lives in aiController);
+// strictLimiter stays reserved for low-volume admin/sensitive endpoints.
+app.use('/api/ai/chat', chatLimiter);
 app.use('/api/sync', sensitiveLimiter);
 
 import opportunityRoutes from './routes/opportunityRoutes';

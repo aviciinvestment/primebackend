@@ -9,6 +9,7 @@ import Cv from '../models/Cv';
 import Mentorship from '../models/Mentorship';
 import MentorshipComplaint from '../models/MentorshipComplaint';
 import { aiReplyCache, embeddingCache } from '../lib/cache';
+import { uploadCvPdf, destroyCvPdf } from '../lib/cloudinary';
 import {
   OFF_TOPIC_REFUSAL,
   isOffTopic,
@@ -58,6 +59,40 @@ const LLM_ATTEMPT_TIMEOUT_MS = 30_000;
 
 type LlmAttempt = { client: OpenAI; model: string };
 
+// Cap concurrent outbound NVIDIA calls so a spike of users can't open unbounded
+// parallel streams (the free tier throttles with 429 / ResourceExhausted under
+// load). A bounded in-flight gate keeps provider load flat so the soft-failure
+// retries above stay effective instead of compounding the flood.
+const MAX_INFLIGHT_LLM = 5;
+let inflightLlm = 0;
+const llmWaiters: Array<() => void> = [];
+
+const acquireLlm = async (): Promise<void> => {
+  while (inflightLlm >= MAX_INFLIGHT_LLM) {
+    await new Promise<void>(resolve => {
+      llmWaiters.push(resolve);
+    });
+  }
+  inflightLlm += 1;
+};
+
+const releaseLlm = (): void => {
+  inflightLlm -= 1;
+  llmWaiters.shift()?.();
+};
+
+// Runs `fn` while holding one LLM slot (acquired before, released in finally).
+// The slot is held for the WHOLE attempt, including stream consumption, so at
+// most MAX_INFLIGHT_LLM providers/streams are ever open at once.
+const withLlmSlot = async <T>(fn: () => Promise<T>): Promise<T> => {
+  await acquireLlm();
+  try {
+    return await fn();
+  } finally {
+    releaseLlm();
+  }
+};
+
 const chatModelAttempts = (): LlmAttempt[] => {
   const attempts: LlmAttempt[] = [];
   const models = [
@@ -102,31 +137,35 @@ async function completeChat(
     for (let round = 0; round < 2; round++) {
       const retrying = round === 1;
       try {
-        const completion = await client.chat.completions.create(
-          {
-            model,
-            messages,
-            temperature: opts.temperature ?? 0.6,
-            top_p: 0.95,
-            max_tokens: opts.maxTokens ?? 700,
-            // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
-            // reasoning models when stream:false is used. Streaming is the only
-            // reliable mode, so ALWAYS request a stream and accumulate the deltas.
-            stream: true,
-          },
-          // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
-          // Passing them inside the body used to be sent to NVIDIA as
-          // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
-          // muse, an explicit validation error for nemotron), which made every
-          // model fail. As the second SDK argument they abort the attempt and are
-          // never serialized into the payload.
-          { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
-        );
         let content = '';
-        for await (const chunk of completion) {
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) content += delta;
-        }
+        // Hold a concurrency slot for the FULL attempt (create + stream
+        // consume) so we never open more than MAX_INFLIGHT_LLM provider streams.
+        await withLlmSlot(async () => {
+          const completion = await client.chat.completions.create(
+            {
+              model,
+              messages,
+              temperature: opts.temperature ?? 0.6,
+              top_p: 0.95,
+              max_tokens: opts.maxTokens ?? 700,
+              // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
+              // reasoning models when stream:false is used. Streaming is the only
+              // reliable mode, so ALWAYS request a stream and accumulate the deltas.
+              stream: true,
+            },
+            // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
+            // Passing them inside the body used to be sent to NVIDIA as
+            // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
+            // muse, an explicit validation error for nemotron), which made every
+            // model fail. As the second SDK argument they abort the attempt and are
+            // never serialized into the payload.
+            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
+          );
+          for await (const chunk of completion) {
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) content += delta;
+          }
+        });
         if (content.trim()) {
           console.log(`LLM OK via ${model}`);
           return { content, model };
@@ -372,7 +411,12 @@ interface RunCvMatchArgs {
   userName: string;
   fileName: string;
   contentType: string;
-  fileData: Buffer;
+  // The raw PDF is stored on Cloudinary for new uploads (cloudinaryId/Url);
+  // fileData is only used as a fallback when Cloudinary is unavailable, and by
+  // legacy (pre-Cloudinary) docs.
+  fileData?: Buffer;
+  cloudinaryId?: string;
+  cloudinaryUrl?: string;
   // When set, refresh the existing CV doc instead of creating a duplicate
   // record (Refresh was creating a brand-new Cv on every click).
   existingCvId?: string;
@@ -381,7 +425,7 @@ interface RunCvMatchArgs {
   replaceSameFile?: boolean;
 }
 
-async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, existingCvId, replaceSameFile }: RunCvMatchArgs) {
+async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }: RunCvMatchArgs) {
   const truncatedCVText = cvText.substring(0, 4000);
 
   const cvVector = await embedText(truncatedCVText);
@@ -445,7 +489,11 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     cv.userName = userName;
     cv.fileName = fileName;
     cv.contentType = contentType;
-    cv.fileData = fileData;
+    if (fileData) cv.fileData = fileData;
+    if (cloudinaryId) {
+      cv.cloudinaryId = cloudinaryId;
+      cv.cloudinaryUrl = cloudinaryUrl || cv.cloudinaryUrl;
+    }
     cv.text = cvText;
     cv.analysis = analysis;
     cv.matchIds = sortedOpportunities.map(o => o!._id);
@@ -456,7 +504,8 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       userName,
       fileName,
       contentType,
-      fileData,
+      ...(fileData ? { fileData } : {}),
+      ...(cloudinaryId ? { cloudinaryId, cloudinaryUrl } : {}),
       text: cvText,
       analysis,
       matchIds: sortedOpportunities.map(o => o!._id),
@@ -466,7 +515,17 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
 
   if (!existingCvId && replaceSameFile) {
     try {
-      await Cv.deleteMany({ _id: { $ne: cv._id }, userId, fileName });
+      // Remove older same-name duplicates AND their orphaned Cloudinary assets
+      // so storage doesn't stack identical files per user.
+      const dups = await Cv.find({ _id: { $ne: cv._id }, userId, fileName })
+        .select('cloudinaryId')
+        .lean();
+      if (dups.length > 0) {
+        await Cv.deleteMany({ _id: { $in: dups.map(d => d._id) } });
+        await Promise.allSettled(
+          dups.filter(d => d.cloudinaryId).map(d => destroyCvPdf(d.cloudinaryId as string))
+        );
+      }
     } catch (dupErr) {
       console.error('Could not remove older duplicate CVs:', dupErr);
     }
@@ -526,6 +585,19 @@ export const analyzeCV = async (req: Request, res: Response) => {
     }
 
     const userId = req.authUser!.uid;
+
+    // Store the raw PDF on Cloudinary (keeps Mongo small); if Cloudinary is
+    // unavailable, fall back to the in-Mongo buffer so downloads never break.
+    let cloudinaryId: string | undefined;
+    let cloudinaryUrl: string | undefined;
+    try {
+      const up = await uploadCvPdf(req.file.buffer, req.file.originalname);
+      cloudinaryId = up.cloudinaryId;
+      cloudinaryUrl = up.cloudinaryUrl;
+    } catch (upErr) {
+      console.error('Cloudinary upload failed — falling back to storing the PDF in Mongo:', upErr);
+    }
+
     const { analysis, matches, cvId } = await runCvMatch({
       cvText,
       userId,
@@ -533,7 +605,9 @@ export const analyzeCV = async (req: Request, res: Response) => {
       userName: req.body.userName || '',
       fileName: req.file.originalname,
       contentType: req.file.mimetype,
-      fileData: req.file.buffer,
+      fileData: cloudinaryId ? undefined : req.file.buffer,
+      cloudinaryId,
+      cloudinaryUrl,
       replaceSameFile: true,
     });
 
@@ -825,27 +899,31 @@ export const chatWithAI = async (req: Request, res: Response) => {
         for (let round = 0; round < 2; round++) {
           const retrying = round === 1;
           try {
-            const completion = await attempt.client.chat.completions.create(
-              {
-                model: attempt.model,
-                messages,
-                temperature: 0.6,
-                top_p: 0.95,
-                max_tokens: 700,
-                stream: true,
-              },
-              // timeout/maxRetries/signal are request options — NVIDIA rejects
-              // them in the body ("Unsupported parameter(s): ...").
-              { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
-            );
-            streamed = true;
-            for await (const chunk of completion) {
-              const delta = chunk.choices?.[0]?.delta?.content;
-              if (delta) {
-                reply += delta;
-                writeSse({ type: 'delta', text: delta });
+            // Hold a concurrency slot for create + stream consumption (see
+            // withLlmSlot) so a chat spike can't open unbounded provider streams.
+            await withLlmSlot(async () => {
+              const completion = await attempt.client.chat.completions.create(
+                {
+                  model: attempt.model,
+                  messages,
+                  temperature: 0.6,
+                  top_p: 0.95,
+                  max_tokens: 700,
+                  stream: true,
+                },
+                // timeout/maxRetries/signal are request options — NVIDIA rejects
+                // them in the body ("Unsupported parameter(s): ...").
+                { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
+              );
+              streamed = true;
+              for await (const chunk of completion) {
+                const delta = chunk.choices?.[0]?.delta?.content;
+                if (delta) {
+                  reply += delta;
+                  writeSse({ type: 'delta', text: delta });
+                }
               }
-            }
+            });
             if (reply.trim()) break;
           } catch (err: any) {
             const detail = describeLlmError(err);
@@ -999,9 +1077,17 @@ export const downloadCV = async (req: Request, res: Response) => {
       return;
     }
 
+    // New uploads live on Cloudinary: redirect straight to the public CDN URL
+    // (single hop; the asset URL is stored at upload time).
+    if (cv.cloudinaryUrl) {
+      return res.redirect(302, cv.cloudinaryUrl);
+    }
+
     const safeName = (cv.fileName || 'cv.pdf').replace(/[^\w.\- ]/g, '').replace(/"/g, '');
     res.setHeader('Content-Type', cv.contentType || 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName || 'cv.pdf'}"`);
+
+    // Legacy docs keep the buffer in Mongo.
     res.send(cv.fileData);
   } catch (error: any) {
     console.error('Error downloading CV:', error);
@@ -1031,6 +1117,11 @@ export const deleteCV = async (req: Request, res: Response) => {
       await pinecone.index(INDEX_NAME).namespace(ns).deleteMany(ids);
     } catch {
       /* namespace may not exist — ignore */
+    }
+
+    // Best-effort removal of the raw PDF asset (never blocks the delete).
+    if (cv.cloudinaryId) {
+      await destroyCvPdf(cv.cloudinaryId);
     }
 
     res.json({ success: true, message: 'CV deleted.' });

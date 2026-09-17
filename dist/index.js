@@ -1227,6 +1227,28 @@ var DAY_MS2 = 24 * 60 * 60 * 1e3;
 var DEFAULT_COUNTDOWN_MS = 5 * DAY_MS2;
 var WELCOME_WINDOW_MS = 2 * DAY_MS2;
 var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+var COUNT_TTL_MS = 3e4;
+var cachedWaitlistCount = -1;
+var cachedWaitlistCountAt = 0;
+var getWaitlistCount = async () => {
+  const now = Date.now();
+  if (cachedWaitlistCount >= 0 && now - cachedWaitlistCountAt < COUNT_TTL_MS) {
+    return cachedWaitlistCount;
+  }
+  cachedWaitlistCount = await WaitlistEntry_default.countDocuments();
+  cachedWaitlistCountAt = now;
+  return cachedWaitlistCount;
+};
+var isAllowedWhatsappUrl = (raw) => {
+  if (!/^https:\/\//i.test(raw)) return false;
+  let hostname;
+  try {
+    hostname = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return hostname === "wa.me" || hostname === "chat.whatsapp.com" || hostname === "whatsapp.com" || hostname.endsWith(".whatsapp.com");
+};
 var getConfig = async () => {
   let config = await LaunchConfig_default.findOne();
   if (!config) {
@@ -1269,7 +1291,8 @@ var getLaunchStatus = async (_req, res) => {
   try {
     await autoLaunchIfDue();
     const config = await getConfig();
-    const waitlistCount = await WaitlistEntry_default.countDocuments();
+    const waitlistCount = await getWaitlistCount();
+    res.setHeader("Cache-Control", "public, max-age=30");
     res.json({ success: true, ...toPublic(config), waitlistCount });
   } catch (error) {
     console.error("Failed to get launch status:", error);
@@ -1288,7 +1311,7 @@ var joinWaitlist = async (req, res) => {
       { upsert: true }
     );
     const config = await getConfig();
-    const waitlistCount = await WaitlistEntry_default.countDocuments();
+    const waitlistCount = await getWaitlistCount();
     res.json({
       success: true,
       waitlistCount,
@@ -1357,8 +1380,11 @@ var setLaunchTimer = async (req, res) => {
 var setWhatsappGroup = async (req, res) => {
   try {
     const url = String(req.body?.url || "").trim();
-    if (url && !/^https:\/\//i.test(url)) {
-      return res.status(400).json({ success: false, error: "Only https:// links are allowed." });
+    if (url && !isAllowedWhatsappUrl(url)) {
+      return res.status(400).json({
+        success: false,
+        error: "Only https:// links to WhatsApp (whatsapp.com, wa.me, chat.whatsapp.com) are allowed."
+      });
     }
     const config = await getConfig();
     config.whatsappGroupUrl = url;
@@ -1461,8 +1487,14 @@ var apiLimiter = (0, import_express_rate_limit.default)(
   process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("api", 120, { store: newMongoStore() }) : makeOptions("api", 120)
 );
 var strictLimiter = (0, import_express_rate_limit.default)(makeOptions("strict", 20, { store: newMongoStore() }));
+var chatLimiter = (0, import_express_rate_limit.default)(
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("chat", 20, { store: newMongoStore() }) : makeOptions("chat", 20)
+);
 var sensitiveLimiter = (0, import_express_rate_limit.default)(makeOptions("sensitive", 5, { store: newMongoStore() }));
 var cvAnalyzeLimiter = (0, import_express_rate_limit.default)(makeOptions("cv", 5, { store: newMongoStore() }));
+var waitlistLimiter = (0, import_express_rate_limit.default)(
+  process.env.RATE_LIMIT_STORE === "mongo" ? makeOptions("waitlist", 5, { store: newMongoStore() }) : makeOptions("waitlist", 5)
+);
 
 // src/lib/withLock.ts
 var import_mongoose5 = __toESM(require("mongoose"));
@@ -1733,7 +1765,7 @@ var import_multer = __toESM(require("multer"));
 
 // src/controllers/aiController.ts
 var import_express4 = require("express");
-var import_crypto = require("crypto");
+var import_crypto2 = require("crypto");
 var import_mongoose10 = require("mongoose");
 var import_pdf_parse = __toESM(require("pdf-parse"));
 var import_pinecone2 = require("@pinecone-database/pinecone");
@@ -1748,7 +1780,9 @@ var CvSchema = new import_mongoose7.Schema(
     userName: { type: String },
     fileName: { type: String, required: true },
     contentType: { type: String, required: true },
-    fileData: { type: Buffer, required: true },
+    fileData: { type: Buffer },
+    cloudinaryId: { type: String },
+    cloudinaryUrl: { type: String },
     text: { type: String },
     analysis: { type: String },
     matchIds: [{ type: import_mongoose7.Schema.Types.ObjectId, ref: "Opportunity" }]
@@ -1848,6 +1882,66 @@ var LRUCache = class {
 };
 var aiReplyCache = new LRUCache(300, 30 * 60 * 1e3);
 var embeddingCache = new LRUCache(2e3, 24 * 60 * 60 * 1e3);
+
+// src/lib/cloudinary.ts
+var import_crypto = require("crypto");
+var CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || "";
+var API_KEY = process.env.CLOUDINARY_API_KEY || "";
+var API_SECRET = process.env.CLOUDINARY_API_SECRET || "";
+var UPLOAD_PRESET = process.env.CLOUDINARY_UPLOAD_PRESET || "prime-cv-uploads";
+var API_BASE_URL = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}`;
+var CV_FOLDER = "prime-opportunity/cvs";
+var BASIC_AUTH = "Basic " + Buffer.from(`${API_KEY}:${API_SECRET}`).toString("base64");
+var isConfigured = () => Boolean(CLOUD_NAME && API_KEY && API_SECRET);
+var uploadCvPdf = async (buffer, originalName) => {
+  if (!isConfigured()) throw new Error("Cloudinary is not configured (missing env vars).");
+  const cleanName = (originalName || "cv.pdf").replace(/[^\w.\- ]/g, "_").slice(0, 40);
+  const publicId = `${Date.now()}-${(0, import_crypto.randomBytes)(4).toString("hex")}-${cleanName}`;
+  const body = new URLSearchParams({
+    upload_preset: UPLOAD_PRESET,
+    folder: CV_FOLDER,
+    public_id: publicId.replace(/\.[a-zA-Z0-9]+$/, ""),
+    file: `data:application/pdf;base64,${buffer.toString("base64")}`
+  });
+  const res = await fetch(`${API_BASE_URL}/raw/upload`, {
+    method: "POST",
+    headers: { Authorization: BASIC_AUTH },
+    body
+  });
+  const bodyJson = await res.json().catch(() => ({}));
+  if (!res.ok || !bodyJson?.public_id) {
+    throw new Error(
+      `Cloudinary upload failed (HTTP ${res.status}): ${bodyJson?.error?.message || res.statusText || "unknown"}`
+    );
+  }
+  return {
+    cloudinaryId: bodyJson.public_id,
+    cloudinaryUrl: bodyJson.secure_url || `https://res.cloudinary.com/${CLOUD_NAME}/raw/upload/${bodyJson.public_id}`
+  };
+};
+var destroyCvPdf = async (publicId) => {
+  try {
+    if (!isConfigured()) return;
+    const body = new URLSearchParams({ public_id: publicId });
+    const res = await fetch(`${API_BASE_URL}/raw/destroy`, {
+      method: "POST",
+      headers: {
+        Authorization: BASIC_AUTH,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body
+    });
+    if (!res.ok) {
+      console.error(
+        "Cloudinary destroy failed (best-effort):",
+        res.status,
+        await res.text().catch(() => "")
+      );
+    }
+  } catch (error) {
+    console.error("Cloudinary destroy failed (best-effort):", error);
+  }
+};
 
 // ../shared/chatPolicies.ts
 var OFF_TOPIC_REFUSAL = "I don't have information on that in this jurisdiction. I can only help you with scholarships, internships, graduate trainee programmes, and fellowships on PrimeOpportunity.";
@@ -1976,6 +2070,29 @@ var nvidiaChatClient2 = new import_openai2.default({
   maxRetries: 1
 });
 var LLM_ATTEMPT_TIMEOUT_MS = 3e4;
+var MAX_INFLIGHT_LLM = 5;
+var inflightLlm = 0;
+var llmWaiters = [];
+var acquireLlm = async () => {
+  while (inflightLlm >= MAX_INFLIGHT_LLM) {
+    await new Promise((resolve) => {
+      llmWaiters.push(resolve);
+    });
+  }
+  inflightLlm += 1;
+};
+var releaseLlm = () => {
+  inflightLlm -= 1;
+  llmWaiters.shift()?.();
+};
+var withLlmSlot = async (fn) => {
+  await acquireLlm();
+  try {
+    return await fn();
+  } finally {
+    releaseLlm();
+  }
+};
 var chatModelAttempts = () => {
   const attempts = [];
   const models = [
@@ -2009,31 +2126,33 @@ async function completeChat(messages, opts = {}) {
     for (let round = 0; round < 2; round++) {
       const retrying = round === 1;
       try {
-        const completion = await client.chat.completions.create(
-          {
-            model: model2,
-            messages,
-            temperature: opts.temperature ?? 0.6,
-            top_p: 0.95,
-            max_tokens: opts.maxTokens ?? 700,
-            // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
-            // reasoning models when stream:false is used. Streaming is the only
-            // reliable mode, so ALWAYS request a stream and accumulate the deltas.
-            stream: true
-          },
-          // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
-          // Passing them inside the body used to be sent to NVIDIA as
-          // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
-          // muse, an explicit validation error for nemotron), which made every
-          // model fail. As the second SDK argument they abort the attempt and are
-          // never serialized into the payload.
-          { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
-        );
         let content = "";
-        for await (const chunk of completion) {
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) content += delta;
-        }
+        await withLlmSlot(async () => {
+          const completion = await client.chat.completions.create(
+            {
+              model: model2,
+              messages,
+              temperature: opts.temperature ?? 0.6,
+              top_p: 0.95,
+              max_tokens: opts.maxTokens ?? 700,
+              // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
+              // reasoning models when stream:false is used. Streaming is the only
+              // reliable mode, so ALWAYS request a stream and accumulate the deltas.
+              stream: true
+            },
+            // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
+            // Passing them inside the body used to be sent to NVIDIA as
+            // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
+            // muse, an explicit validation error for nemotron), which made every
+            // model fail. As the second SDK argument they abort the attempt and are
+            // never serialized into the payload.
+            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
+          );
+          for await (const chunk of completion) {
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) content += delta;
+          }
+        });
         if (content.trim()) {
           console.log(`LLM OK via ${model2}`);
           return { content, model: model2 };
@@ -2086,7 +2205,7 @@ var sweepChatBuckets = () => {
 setInterval(sweepChatBuckets, CHAT_RATE_SWEEP_MS).unref();
 var CV_NAMESPACE_PREFIX = "cvs-";
 var embedText = async (text) => {
-  const key = (0, import_crypto.createHash)("sha256").update(text).digest("hex");
+  const key = (0, import_crypto2.createHash)("sha256").update(text).digest("hex");
   const cached = embeddingCache.get(key);
   if (cached) return cached;
   const response = await nvidiaEmbedClient.embeddings.create({
@@ -2185,7 +2304,7 @@ var seedUserCvVectors = async (cvText, userId, cvId, fileName) => {
   await index.namespace(namespace).upsert(vectors);
   return { namespace, chunks: vectors.length };
 };
-async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, existingCvId, replaceSameFile }) {
+async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, cloudinaryId, cloudinaryUrl, existingCvId, replaceSameFile }) {
   const truncatedCVText = cvText.substring(0, 4e3);
   const cvVector = await embedText(truncatedCVText);
   const index = pinecone2.index(INDEX_NAME2);
@@ -2237,7 +2356,11 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     cv.userName = userName;
     cv.fileName = fileName;
     cv.contentType = contentType;
-    cv.fileData = fileData;
+    if (fileData) cv.fileData = fileData;
+    if (cloudinaryId) {
+      cv.cloudinaryId = cloudinaryId;
+      cv.cloudinaryUrl = cloudinaryUrl || cv.cloudinaryUrl;
+    }
     cv.text = cvText;
     cv.analysis = analysis;
     cv.matchIds = sortedOpportunities.map((o) => o._id);
@@ -2248,7 +2371,8 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
       userName,
       fileName,
       contentType,
-      fileData,
+      ...fileData ? { fileData } : {},
+      ...cloudinaryId ? { cloudinaryId, cloudinaryUrl } : {},
       text: cvText,
       analysis,
       matchIds: sortedOpportunities.map((o) => o._id)
@@ -2257,7 +2381,13 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
   await cv.save();
   if (!existingCvId && replaceSameFile) {
     try {
-      await Cv_default.deleteMany({ _id: { $ne: cv._id }, userId, fileName });
+      const dups = await Cv_default.find({ _id: { $ne: cv._id }, userId, fileName }).select("cloudinaryId").lean();
+      if (dups.length > 0) {
+        await Cv_default.deleteMany({ _id: { $in: dups.map((d) => d._id) } });
+        await Promise.allSettled(
+          dups.filter((d) => d.cloudinaryId).map((d) => destroyCvPdf(d.cloudinaryId))
+        );
+      }
     } catch (dupErr) {
       console.error("Could not remove older duplicate CVs:", dupErr);
     }
@@ -2302,6 +2432,15 @@ var analyzeCV = async (req, res) => {
       return;
     }
     const userId = req.authUser.uid;
+    let cloudinaryId;
+    let cloudinaryUrl;
+    try {
+      const up = await uploadCvPdf(req.file.buffer, req.file.originalname);
+      cloudinaryId = up.cloudinaryId;
+      cloudinaryUrl = up.cloudinaryUrl;
+    } catch (upErr) {
+      console.error("Cloudinary upload failed \u2014 falling back to storing the PDF in Mongo:", upErr);
+    }
     const { analysis, matches, cvId } = await runCvMatch({
       cvText,
       userId,
@@ -2309,7 +2448,9 @@ var analyzeCV = async (req, res) => {
       userName: req.body.userName || "",
       fileName: req.file.originalname,
       contentType: req.file.mimetype,
-      fileData: req.file.buffer,
+      fileData: cloudinaryId ? void 0 : req.file.buffer,
+      cloudinaryId,
+      cloudinaryUrl,
       replaceSameFile: true
     });
     res.json({ success: true, analysis, matches, cvId });
@@ -2400,7 +2541,7 @@ var chatWithAI = async (req, res) => {
     if (stream) {
       startSse();
     }
-    const cacheKey = (0, import_crypto.createHash)("sha256").update(`${userId}|${message}`).digest("hex");
+    const cacheKey = (0, import_crypto2.createHash)("sha256").update(`${userId}|${message}`).digest("hex");
     const cached = aiReplyCache.get(cacheKey);
     if (cached) {
       return respondDone(cached.reply);
@@ -2496,27 +2637,29 @@ var chatWithAI = async (req, res) => {
         for (let round = 0; round < 2; round++) {
           const retrying = round === 1;
           try {
-            const completion = await attempt.client.chat.completions.create(
-              {
-                model: attempt.model,
-                messages,
-                temperature: 0.6,
-                top_p: 0.95,
-                max_tokens: 700,
-                stream: true
-              },
-              // timeout/maxRetries/signal are request options — NVIDIA rejects
-              // them in the body ("Unsupported parameter(s): ...").
-              { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
-            );
-            streamed = true;
-            for await (const chunk of completion) {
-              const delta = chunk.choices?.[0]?.delta?.content;
-              if (delta) {
-                reply2 += delta;
-                writeSse({ type: "delta", text: delta });
+            await withLlmSlot(async () => {
+              const completion = await attempt.client.chat.completions.create(
+                {
+                  model: attempt.model,
+                  messages,
+                  temperature: 0.6,
+                  top_p: 0.95,
+                  max_tokens: 700,
+                  stream: true
+                },
+                // timeout/maxRetries/signal are request options — NVIDIA rejects
+                // them in the body ("Unsupported parameter(s): ...").
+                { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
+              );
+              streamed = true;
+              for await (const chunk of completion) {
+                const delta = chunk.choices?.[0]?.delta?.content;
+                if (delta) {
+                  reply2 += delta;
+                  writeSse({ type: "delta", text: delta });
+                }
               }
-            }
+            });
             if (reply2.trim()) break;
           } catch (err) {
             const detail = describeLlmError(err);
@@ -2715,6 +2858,9 @@ var downloadCV = async (req, res) => {
       res.status(404).json({ success: false, message: "CV not found." });
       return;
     }
+    if (cv.cloudinaryUrl) {
+      return res.redirect(302, cv.cloudinaryUrl);
+    }
     const safeName = (cv.fileName || "cv.pdf").replace(/[^\w.\- ]/g, "").replace(/"/g, "");
     res.setHeader("Content-Type", cv.contentType || "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${safeName || "cv.pdf"}"`);
@@ -2742,6 +2888,9 @@ var deleteCV = async (req, res) => {
       const ids = Array.from({ length: 6 }, (_, i) => `${cvId}-chunk-${i}`);
       await pinecone2.index(INDEX_NAME2).namespace(ns).deleteMany(ids);
     } catch {
+    }
+    if (cv.cloudinaryId) {
+      await destroyCvPdf(cv.cloudinaryId);
     }
     res.json({ success: true, message: "CV deleted." });
   } catch (error) {
@@ -3548,7 +3697,7 @@ var adminRoutes_default = router8;
 var import_express17 = __toESM(require("express"));
 var router9 = import_express17.default.Router();
 router9.get("/status", getLaunchStatus);
-router9.post("/waitlist", joinWaitlist);
+router9.post("/waitlist", waitlistLimiter, joinWaitlist);
 var launchRoutes_default = router9;
 
 // src/index.ts
@@ -3556,7 +3705,12 @@ var app2 = (0, import_express18.default)();
 var port = process.env.PORT || 5e3;
 app2.set("trust proxy", true);
 app2.use((0, import_helmet.default)());
-app2.use((0, import_compression.default)());
+app2.use((0, import_compression.default)({
+  filter: (req, res) => {
+    const contentType = String(res.getHeader("Content-Type") || "");
+    return !contentType.includes("text/event-stream") && import_compression.default.filter(req, res);
+  }
+}));
 var defaultOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
 var configuredOrigins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
 var allowedOrigins = configuredOrigins.length > 0 ? configuredOrigins : defaultOrigins;
@@ -3573,7 +3727,7 @@ app2.use(
 );
 app2.use(import_express18.default.json({ limit: "1mb" }));
 app2.use("/api", apiLimiter);
-app2.use("/api/ai/chat", strictLimiter);
+app2.use("/api/ai/chat", chatLimiter);
 app2.use("/api/sync", sensitiveLimiter);
 var healthHandler = (_req, res) => {
   const dbReady = import_mongoose14.default.connection.readyState === 1;
