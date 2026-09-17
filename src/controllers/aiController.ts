@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { createHash } from 'crypto';
 import { isValidObjectId } from 'mongoose';
-import { PDFParse } from 'pdf-parse';
+import pdfParse from 'pdf-parse';
 import { Pinecone } from '@pinecone-database/pinecone';
 import OpenAI from 'openai';
 import Opportunity from '../models/Opportunity';
@@ -62,8 +62,8 @@ const chatModelAttempts = (): LlmAttempt[] => {
   const attempts: LlmAttempt[] = [];
   const models = [
     'meta/muse-glimmer-30b',
-    'z-ai/glm-5.3-flash',
     'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+    'z-ai/glm-5.3-flash',
   ];
   for (const model of models) {
     attempts.push({ client: nvidiaChatClient, model });
@@ -95,41 +95,60 @@ async function completeChat(
   const failures: string[] = [];
   for (const attempt of chatModelAttempts()) {
     const { client, model } = attempt;
-    try {
-      const completion = await client.chat.completions.create(
-        {
-          model,
-          messages,
-          temperature: opts.temperature ?? 0.6,
-          top_p: 0.95,
-          max_tokens: opts.maxTokens ?? 700,
-          // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
-          // reasoning models when stream:false is used. Streaming is the only
-          // reliable mode, so ALWAYS request a stream and accumulate the deltas.
-          stream: true,
-        },
-        // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
-        // Passing them inside the body used to be sent to NVIDIA as
-        // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
-        // muse, an explicit validation error for nemotron), which made every
-        // model fail. As the second SDK argument they abort the attempt and are
-        // never serialized into the payload.
-        { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
-      );
-      let content = '';
-      for await (const chunk of completion) {
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) content += delta;
+    // One immediate retry per model for SOFT failures (empty stream, timeouts,
+    // NVIDIA capacity "ResourceExhausted", 429/overloaded). NVIDIA shards can
+    // return an empty stream or refuse capacity on the first hit and answer on
+    // the retry; hard failures (400/404) skip ahead instantly.
+    for (let round = 0; round < 2; round++) {
+      const retrying = round === 1;
+      try {
+        const completion = await client.chat.completions.create(
+          {
+            model,
+            messages,
+            temperature: opts.temperature ?? 0.6,
+            top_p: 0.95,
+            max_tokens: opts.maxTokens ?? 700,
+            // NVIDIA AI Endpoints returns HTTP 400 with an EMPTY body for these
+            // reasoning models when stream:false is used. Streaming is the only
+            // reliable mode, so ALWAYS request a stream and accumulate the deltas.
+            stream: true,
+          },
+          // timeout/maxRetries/signal are REQUEST OPTIONS, not body parameters.
+          // Passing them inside the body used to be sent to NVIDIA as
+          // `"Unsupported parameter(s): timeout, maxRetries"` (a bare 400 for
+          // muse, an explicit validation error for nemotron), which made every
+          // model fail. As the second SDK argument they abort the attempt and are
+          // never serialized into the payload.
+          { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0 }
+        );
+        let content = '';
+        for await (const chunk of completion) {
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) content += delta;
+        }
+        if (content.trim()) {
+          console.log(`LLM OK via ${model}`);
+          return { content, model };
+        }
+        if (!retrying) {
+          failures.push(`${model} -> empty completion, retrying...`);
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        failures.push(`${model} -> empty completion`);
+      } catch (err: any) {
+        const detail = describeLlmError(err);
+        const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
+        if (!retrying && soft) {
+          failures.push(`${model} -> ${detail}, retrying...`);
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        failures.push(`${model} -> ${detail}`);
+        console.warn(`LLM model ${model} failed: ${detail}`);
       }
-      if (content.trim()) {
-        console.log(`LLM OK via ${model}`);
-        return { content, model };
-      }
-      failures.push(`${model} -> empty completion`);
-    } catch (err: any) {
-      const detail = describeLlmError(err);
-      failures.push(`${model} -> ${detail}`);
-      console.warn(`LLM model ${model} failed, trying next candidate: ${detail}`);
+      break;
     }
   }
   throw new Error(failures.join(' | ') || 'All configured LLM providers failed.');
@@ -354,9 +373,15 @@ interface RunCvMatchArgs {
   fileName: string;
   contentType: string;
   fileData: Buffer;
+  // When set, refresh the existing CV doc instead of creating a duplicate
+  // record (Refresh was creating a brand-new Cv on every click).
+  existingCvId?: string;
+  // On a fresh upload, delete the user's OLDER CVs that share the same file
+  // name so re-uploads don't pile up identical twins in the list.
+  replaceSameFile?: boolean;
 }
 
-async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData }: RunCvMatchArgs) {
+async function runCvMatch({ cvText, userId, userEmail, userName, fileName, contentType, fileData, existingCvId, replaceSameFile }: RunCvMatchArgs) {
   const truncatedCVText = cvText.substring(0, 4000);
 
   const cvVector = await embedText(truncatedCVText);
@@ -406,18 +431,46 @@ Provide a personalized, encouraging response to the user. Use markdown formattin
     analysis = `Your top matching opportunities were updated. The AI summary is temporarily unavailable — try refreshing the analysis again in a moment. (Server detail: ${llmErr?.message || 'unknown'})`;
   }
 
-  const cv = new Cv({
-    userId,
-    userEmail,
-    userName,
-    fileName,
-    contentType,
-    fileData,
-    text: cvText,
-    analysis,
-    matchIds: sortedOpportunities.map(o => o!._id),
-  });
+  // Upsert semantics: Refresh updates the existing doc in place (no new
+  // record); a fresh upload replaces older records with the SAME fileName so
+  // re-uploads never pile up identical twins (which made "delete" look broken
+  // — deleting one copy left another identical one in the list).
+  let cv: any;
+  if (existingCvId) {
+    cv = await Cv.findById(existingCvId);
+    if (!cv) {
+      throw new Error('The saved CV no longer exists. Please upload a fresh PDF.');
+    }
+    cv.userEmail = userEmail;
+    cv.userName = userName;
+    cv.fileName = fileName;
+    cv.contentType = contentType;
+    cv.fileData = fileData;
+    cv.text = cvText;
+    cv.analysis = analysis;
+    cv.matchIds = sortedOpportunities.map(o => o!._id);
+  } else {
+    cv = new Cv({
+      userId,
+      userEmail,
+      userName,
+      fileName,
+      contentType,
+      fileData,
+      text: cvText,
+      analysis,
+      matchIds: sortedOpportunities.map(o => o!._id),
+    });
+  }
   await cv.save();
+
+  if (!existingCvId && replaceSameFile) {
+    try {
+      await Cv.deleteMany({ _id: { $ne: cv._id }, userId, fileName });
+    } catch (dupErr) {
+      console.error('Could not remove older duplicate CVs:', dupErr);
+    }
+  }
 
   // Seed CV vectors into the user's private Pinecone namespace so the chat
   // assistant has personalized context. Failure must NOT block the result.
@@ -448,10 +501,13 @@ export const analyzeCV = async (req: Request, res: Response) => {
       return;
     }
 
-    const parser = new PDFParse({ data: req.file.buffer });
+    // pdf-parse@1.1.4 is a plain async function (module.exports = Pdf), so it is
+    // called directly with the buffer — `new PDFParse(...)` (the v2 API) was
+    // undefined here, making EVERY upload crash with "PDFParse is not a
+    // constructor" and a generic 500 "Failed to analyze CV.".
     let pdfData: { text: string };
     try {
-      pdfData = await parser.getText();
+      pdfData = await pdfParse(req.file.buffer);
     } catch (pdfErr: any) {
       console.error('PDF parsing failed:', pdfErr);
       res.status(400).json({
@@ -461,10 +517,8 @@ export const analyzeCV = async (req: Request, res: Response) => {
         error: pdfErr?.message,
       });
       return;
-    } finally {
-      await parser.destroy().catch(() => {});
     }
-    const cvText = pdfData.text.trim();
+    const cvText = (pdfData.text || '').trim();
 
     if (!cvText) {
       res.status(400).json({ success: false, message: 'Could not extract text from the provided PDF.' });
@@ -480,6 +534,7 @@ export const analyzeCV = async (req: Request, res: Response) => {
       fileName: req.file.originalname,
       contentType: req.file.mimetype,
       fileData: req.file.buffer,
+      replaceSameFile: true,
     });
 
     res.json({ success: true, analysis, matches, cvId });
@@ -522,6 +577,7 @@ export const reanalyzeCV = async (req: Request, res: Response) => {
       contentType: latestCv.contentType,
       fileData: latestCv.fileData,
       userName: req.body?.userName || latestCv.userName || '',
+      existingCvId: latestCv._id.toString(),
     });
 
     res.json({ success: true, analysis, matches, cvId });
@@ -766,32 +822,43 @@ export const chatWithAI = async (req: Request, res: Response) => {
       let streamed = false;
       for (const attempt of chatModelAttempts()) {
         if (abort.signal.aborted) break;
-        try {
-          const completion = await attempt.client.chat.completions.create(
-            {
-              model: attempt.model,
-              messages,
-              temperature: 0.6,
-              top_p: 0.95,
-              max_tokens: 700,
-              stream: true,
-            },
-            // timeout/maxRetries/signal are request options — NVIDIA rejects
-            // them in the body ("Unsupported parameter(s): ...").
-            { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
-          );
-          streamed = true;
-          for await (const chunk of completion) {
-            const delta = chunk.choices?.[0]?.delta?.content;
-            if (delta) {
-              reply += delta;
-              writeSse({ type: 'delta', text: delta });
+        for (let round = 0; round < 2; round++) {
+          const retrying = round === 1;
+          try {
+            const completion = await attempt.client.chat.completions.create(
+              {
+                model: attempt.model,
+                messages,
+                temperature: 0.6,
+                top_p: 0.95,
+                max_tokens: 700,
+                stream: true,
+              },
+              // timeout/maxRetries/signal are request options — NVIDIA rejects
+              // them in the body ("Unsupported parameter(s): ...").
+              { timeout: LLM_ATTEMPT_TIMEOUT_MS, maxRetries: 0, signal: abort.signal }
+            );
+            streamed = true;
+            for await (const chunk of completion) {
+              const delta = chunk.choices?.[0]?.delta?.content;
+              if (delta) {
+                reply += delta;
+                writeSse({ type: 'delta', text: delta });
+              }
+            }
+            if (reply.trim()) break;
+          } catch (err: any) {
+            const detail = describeLlmError(err);
+            const soft = /empty|timeout|ResourceExhausted|429|too many|overloaded|unavailable/i.test(detail);
+            console.warn(`Chat stream model ${attempt.model} failed: ${detail}${retrying ? '' : ', retrying...'}`);
+            if (!retrying && soft) {
+              await new Promise(r => setTimeout(r, 1500));
+              continue;
             }
           }
           break;
-        } catch (err: any) {
-          console.warn(`Chat stream model ${attempt.model} failed: ${describeLlmError(err)}`);
         }
+        if (reply.trim() || abort.signal.aborted) break;
       }
       if (!streamed) {
         writeSse({ type: 'error', message: 'All AI providers are unavailable right now. Please try again shortly.' });
