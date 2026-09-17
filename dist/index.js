@@ -2240,8 +2240,21 @@ var analyzeCV = async (req, res) => {
       return;
     }
     const parser = new import_pdf_parse.PDFParse({ data: req.file.buffer });
-    const pdfData = await parser.getText();
-    await parser.destroy();
+    let pdfData;
+    try {
+      pdfData = await parser.getText();
+    } catch (pdfErr) {
+      console.error("PDF parsing failed:", pdfErr);
+      res.status(400).json({
+        success: false,
+        message: "Could not read this PDF. It may be password-protected or damaged \u2014 re-export it as a standard text PDF and try again.",
+        error: pdfErr?.message
+      });
+      return;
+    } finally {
+      await parser.destroy().catch(() => {
+      });
+    }
     const cvText = pdfData.text.trim();
     if (!cvText) {
       res.status(400).json({ success: false, message: "Could not extract text from the provided PDF." });
@@ -2677,7 +2690,11 @@ var deleteCV = async (req, res) => {
     res.json({ success: true, message: "CV deleted." });
   } catch (error) {
     console.error("Error deleting CV:", error);
-    res.status(500).json({ success: false, message: "Failed to delete CV." });
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete CV.",
+      error: error.message
+    });
   }
 };
 var getRetrievedOpportunityContext = async (req, res) => {
