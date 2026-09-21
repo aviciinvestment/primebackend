@@ -8,6 +8,7 @@ import {
   reviewMentorApplication,
   listComplaints,
   resolveComplaint,
+  listChats,
 } from '../controllers/adminController';
 import { requireAdmin } from '../middleware/auth';
 import {
@@ -26,6 +27,7 @@ router.get('/users', listUsers);
 router.get('/mentors', listMentors);
 router.get('/mentees', listMentees);
 router.get('/complaints', listComplaints);
+router.get('/chats', listChats);
 router.get('/launch', getAdminLaunch);
 router.post('/launch/state', setLaunchState);
 router.post('/launch/timer', setLaunchTimer);

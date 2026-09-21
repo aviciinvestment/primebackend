@@ -8,6 +8,7 @@ import {
   chatWithAI,
   getRetrievedOpportunityContext,
   recordMentorshipComplaint,
+  logChat,
 } from '../controllers/aiController';
 import { requireAuth } from '../middleware/auth';
 import { cvAnalyzeLimiter } from '../middleware/rateLimit';
@@ -46,5 +47,10 @@ router.post('/chat', requireAuth, chatWithAI);
 // DB-backed endpoints consumed by the Cloudflare Worker chat pipeline.
 router.post('/opportunity-context', requireAuth, getRetrievedOpportunityContext);
 router.post('/mentorship-complaint', requireAuth, recordMentorshipComplaint);
+
+// The Worker streamed a reply itself — log the finished exchange here so the
+// admin Chat Activity feed covers worker-side chats too. Same identity rules:
+// the forwarded Firebase token is verified, so the log row can't be forged.
+router.post('/chat-log', requireAuth, logChat);
 
 export default router;

@@ -8,6 +8,7 @@ import Opportunity from '../models/Opportunity';
 import Cv from '../models/Cv';
 import Mentorship from '../models/Mentorship';
 import MentorshipComplaint from '../models/MentorshipComplaint';
+import ChatLog from '../models/ChatLog';
 import { aiReplyCache, embeddingCache } from '../lib/cache';
 import { uploadCvPdf, destroyCvPdf } from '../lib/cloudinary';
 import {
@@ -362,6 +363,31 @@ const handleMentorshipComplaint = async (message: string, userId: string, userEm
     console.error('Failed to persist mentorship complaint:', err);
   }
   return buildComplaintReply(userEmail, ticket);
+};
+
+// Fire-and-forget persistence of one finished chat exchange (used by ALL reply
+// paths so the admin Chat Activity feed captures cache hits, guardrail
+// refusals, complaints, mentorship offers and real LLM answers alike). Never
+// awaits: a DB hiccup must not delay or fail the response it is side-caring.
+const persistChatLog = (entry: {
+  userId: string;
+  userEmail: string;
+  userName: string;
+  message: string;
+  reply: string;
+  source: 'server' | 'worker';
+}): void => {
+  void (async () => {
+    try {
+      await ChatLog.create({
+        ...entry,
+        message: entry.message.slice(0, 2000),
+        reply: entry.reply.slice(0, 8000),
+      });
+    } catch (err) {
+      console.error('Failed to persist chat log:', err);
+    }
+  })();
 };
 
 const chunkText = (text: string, chunkSize = 1000, overlap = 150): string[] => {
@@ -757,6 +783,8 @@ export const chatWithAI = async (req: Request, res: Response) => {
       if (stream && !res.writableEnded) res.write(`data: ${JSON.stringify(frame)}\n\n`);
     };
     const respondDone = (reply: string, action?: { type: 'mentorship' }) => {
+      // Log every finished exchange (best-effort, never blocks the response).
+      persistChatLog({ userId, userEmail, userName, message, reply, source: 'server' });
       if (stream) {
         writeSse({ type: 'done', reply, action: action || null });
         res.end();
@@ -979,6 +1007,7 @@ export const chatWithAI = async (req: Request, res: Response) => {
         reply = 'Sorry, I could not generate a response. Please try again.';
       }
       aiReplyCache.set(cacheKey, { reply });
+      persistChatLog({ userId, userEmail, userName, message, reply, source: 'server' });
       writeSse({ type: 'done', reply });
       res.end();
       return;
@@ -989,6 +1018,7 @@ export const chatWithAI = async (req: Request, res: Response) => {
     const reply = nonStreamReply.trim() || 'Sorry, I could not generate a response. Please try again.';
 
     aiReplyCache.set(cacheKey, { reply });
+    persistChatLog({ userId, userEmail, userName, message, reply, source: 'server' });
     res.json({ success: true, reply });
   } catch (error: any) {
     // A busy gate is a TRANSIENT condition (queue full for a moment), handled
@@ -1351,5 +1381,27 @@ export const recordMentorshipComplaint = async (req: Request, res: Response) => 
     console.error('Failed to record mentorship complaint:', error);
     res.status(500).json({ success: false, error: 'Failed to record mentorship complaint.' });
   }
+};
+
+// Endpoint consumed by the Cloudflare Worker chat pipeline: persist a finished
+// exchange produced on the WORKER (whose reply is streamed straight to the
+// user, bypassing this Express server). Fire-and-forget semantics on the worker
+// side; identity is re-verified via the forwarded Firebase Authorization header.
+export const logChat = async (req: Request, res: Response) => {
+  const message = ((req.body?.message as string) || '').trim();
+  const reply = ((req.body?.reply as string) || '').trim();
+  if (!message || !reply) {
+    return res.status(400).json({ success: false, error: 'message and reply are required.' });
+  }
+
+  persistChatLog({
+    userId: req.authUser!.uid,
+    userEmail: req.authUser!.email || '',
+    userName: ((req.body?.userName as string) || '').trim(),
+    message,
+    reply,
+    source: 'worker',
+  });
+  res.json({ success: true });
 };
 

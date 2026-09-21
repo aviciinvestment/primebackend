@@ -4,6 +4,7 @@ import AppUser from '../models/AppUser';
 import Mentor from '../models/Mentor';
 import Mentorship from '../models/Mentorship';
 import MentorshipComplaint from '../models/MentorshipComplaint';
+import ChatLog from '../models/ChatLog';
 
 const PLATFORM_CUT = 0.1; // platform keeps 10% of every mentee payment
 
@@ -227,6 +228,35 @@ export const resolveComplaint = async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Failed to resolve complaint:', error);
     res.status(500).json({ success: false, error: 'Failed to resolve complaint.' });
+  }
+};
+
+export const listChats = async (req: Request, res: Response) => {
+  try {
+    const { page, limit, skip } = parsePagination(req);
+    const [logs, total] = await Promise.all([
+      ChatLog.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      ChatLog.countDocuments(),
+    ]);
+    res.json({
+      success: true,
+      chats: logs.map(l => ({
+        _id: l._id,
+        userId: l.userId,
+        userEmail: l.userEmail,
+        userName: l.userName,
+        message: l.message,
+        reply: l.reply,
+        source: l.source,
+        createdAt: l.createdAt,
+      })),
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+    });
+  } catch (error: any) {
+    console.error('Failed to list chats:', error);
+    res.status(500).json({ success: false, error: 'Failed to list chats.' });
   }
 };
 
