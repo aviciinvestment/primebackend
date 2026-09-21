@@ -37,7 +37,7 @@ var import_config = require("dotenv/config");
 var import_express18 = __toESM(require("express"));
 var import_compression = __toESM(require("compression"));
 var import_cors = __toESM(require("cors"));
-var import_mongoose14 = __toESM(require("mongoose"));
+var import_mongoose15 = __toESM(require("mongoose"));
 var import_node_cron = __toESM(require("node-cron"));
 var import_helmet = __toESM(require("helmet"));
 var import_multer2 = __toESM(require("multer"));
@@ -1416,7 +1416,7 @@ var setWhatsappGroup = async (req, res) => {
 // src/controllers/aiController.ts
 var import_express3 = require("express");
 var import_crypto2 = require("crypto");
-var import_mongoose7 = require("mongoose");
+var import_mongoose8 = require("mongoose");
 var import_pdf_parse = __toESM(require("pdf-parse"));
 var import_pinecone2 = require("@pinecone-database/pinecone");
 var import_openai2 = __toESM(require("openai"));
@@ -1498,6 +1498,25 @@ var MentorshipComplaintSchema = new import_mongoose6.Schema(
 );
 MentorshipComplaintSchema.index({ status: 1, createdAt: -1 });
 var MentorshipComplaint_default = import_mongoose6.default.model("MentorshipComplaint", MentorshipComplaintSchema);
+
+// src/models/ChatLog.ts
+var import_mongoose7 = __toESM(require("mongoose"));
+var ChatLogSchema = new import_mongoose7.Schema(
+  {
+    // Filled from the VERIFIED Firebase token (never the request body).
+    userId: { type: String, index: true },
+    userEmail: { type: String, trim: true, lowercase: true, index: true },
+    // Display name — safe to keep the client-sent value here because this is
+    // only used for admin readability, never for authorization or addressing.
+    userName: { type: String, trim: true, maxlength: 120 },
+    message: { type: String, required: true, trim: true, maxlength: 2e3 },
+    reply: { type: String, required: true, trim: true, maxlength: 8e3 },
+    source: { type: String, enum: ["server", "worker"], required: true }
+  },
+  { timestamps: true }
+);
+ChatLogSchema.index({ createdAt: -1 });
+var ChatLog_default = import_mongoose7.default.model("ChatLog", ChatLogSchema);
 
 // src/lib/cache.ts
 var LRUCache = class {
@@ -1924,6 +1943,19 @@ var handleMentorshipComplaint = async (message, userId, userEmail, userName) => 
   }
   return buildComplaintReply(userEmail, ticket);
 };
+var persistChatLog = (entry) => {
+  void (async () => {
+    try {
+      await ChatLog_default.create({
+        ...entry,
+        message: entry.message.slice(0, 2e3),
+        reply: entry.reply.slice(0, 8e3)
+      });
+    } catch (err) {
+      console.error("Failed to persist chat log:", err);
+    }
+  })();
+};
 var chunkText = (text, chunkSize = 1e3, overlap = 150) => {
   const clean = text.trim();
   if (clean.length <= chunkSize) return [clean];
@@ -2171,6 +2203,7 @@ var chatWithAI = async (req, res) => {
 `);
     };
     const respondDone = (reply2, action) => {
+      persistChatLog({ userId, userEmail, userName, message, reply: reply2, source: "server" });
       if (stream) {
         writeSse({ type: "done", reply: reply2, action: action || null });
         res.end();
@@ -2325,6 +2358,7 @@ var chatWithAI = async (req, res) => {
         reply2 = "Sorry, I could not generate a response. Please try again.";
       }
       aiReplyCache.set(cacheKey, { reply: reply2 });
+      persistChatLog({ userId, userEmail, userName, message, reply: reply2, source: "server" });
       writeSse({ type: "done", reply: reply2 });
       res.end();
       return;
@@ -2332,6 +2366,7 @@ var chatWithAI = async (req, res) => {
     const { content: nonStreamReply } = await completeChat(messages, { temperature: 0.6, maxTokens: 700 });
     const reply = nonStreamReply.trim() || "Sorry, I could not generate a response. Please try again.";
     aiReplyCache.set(cacheKey, { reply });
+    persistChatLog({ userId, userEmail, userName, message, reply, source: "server" });
     res.json({ success: true, reply });
   } catch (error) {
     if (error instanceof LlmBusyError) {
@@ -2499,7 +2534,7 @@ var downloadCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose7.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -2542,7 +2577,7 @@ var deleteCV = async (req, res) => {
   try {
     const { cvId } = req.params;
     const userId = req.authUser.uid;
-    if (!(0, import_mongoose7.isValidObjectId)(cvId)) {
+    if (!(0, import_mongoose8.isValidObjectId)(cvId)) {
       res.status(400).json({ success: false, message: "Invalid CV id." });
       return;
     }
@@ -2596,7 +2631,7 @@ var refreshCvMatches = async () => {
       if (!(isObjectIdArray && matchesEqual(doc.matchIds, matchIds))) {
         await Cv_default.updateOne(
           { _id: doc._id },
-          { $set: { matchIds: matchIds.map((id) => new import_mongoose7.Types.ObjectId(id)) } }
+          { $set: { matchIds: matchIds.map((id) => new import_mongoose8.Types.ObjectId(id)) } }
         );
         refreshed += 1;
       }
@@ -2642,7 +2677,7 @@ var refreshCvMatches = async () => {
 var getRetrievedOpportunityContext = async (req, res) => {
   try {
     const rawIds = req.body?.ids;
-    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose7.isValidObjectId)(id)).slice(0, 8) : [];
+    const ids = Array.isArray(rawIds) ? rawIds.filter((id) => typeof id === "string" && (0, import_mongoose8.isValidObjectId)(id)).slice(0, 8) : [];
     if (ids.length === 0) {
       return res.json({ success: true, context: null });
     }
@@ -2676,13 +2711,29 @@ var recordMentorshipComplaint = async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to record mentorship complaint." });
   }
 };
+var logChat = async (req, res) => {
+  const message = (req.body?.message || "").trim();
+  const reply = (req.body?.reply || "").trim();
+  if (!message || !reply) {
+    return res.status(400).json({ success: false, error: "message and reply are required." });
+  }
+  persistChatLog({
+    userId: req.authUser.uid,
+    userEmail: req.authUser.email || "",
+    userName: (req.body?.userName || "").trim(),
+    message,
+    reply,
+    source: "worker"
+  });
+  res.json({ success: true });
+};
 
 // src/middleware/rateLimit.ts
 var import_express_rate_limit = __toESM(require("express-rate-limit"));
 
 // src/middleware/mongoStore.ts
-var import_mongoose8 = require("mongoose");
-var RateLimitSchema = new import_mongoose8.Schema(
+var import_mongoose9 = require("mongoose");
+var RateLimitSchema = new import_mongoose9.Schema(
   {
     _id: { type: String, required: true },
     counter: { type: Number, required: true, default: 0 },
@@ -2693,7 +2744,7 @@ var RateLimitSchema = new import_mongoose8.Schema(
 var RateLimitModel = null;
 var getModel = () => {
   if (!RateLimitModel) {
-    RateLimitModel = (0, import_mongoose8.model)("RateLimit", RateLimitSchema);
+    RateLimitModel = (0, import_mongoose9.model)("RateLimit", RateLimitSchema);
     RateLimitModel.collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch((err) => console.error("[rate-limit] Could not create TTL index:", err));
   }
   return RateLimitModel;
@@ -2789,8 +2840,8 @@ var waitlistLimiter = (0, import_express_rate_limit.default)(
 );
 
 // src/lib/withLock.ts
-var import_mongoose9 = __toESM(require("mongoose"));
-var SyncLockSchema = new import_mongoose9.Schema(
+var import_mongoose10 = __toESM(require("mongoose"));
+var SyncLockSchema = new import_mongoose10.Schema(
   {
     _id: { type: String, required: true },
     // lock name
@@ -2800,7 +2851,7 @@ var SyncLockSchema = new import_mongoose9.Schema(
   },
   { versionKey: false }
 );
-var SyncLock = import_mongoose9.default.models.SyncLock || import_mongoose9.default.model("SyncLock", SyncLockSchema);
+var SyncLock = import_mongoose10.default.models.SyncLock || import_mongoose10.default.model("SyncLock", SyncLockSchema);
 var acquire = async (name, ttlMs, owner) => {
   const now = /* @__PURE__ */ new Date();
   const result = await SyncLock.findOneAndUpdate(
@@ -2974,8 +3025,8 @@ var getAdminAuth = () => {
 };
 
 // src/models/AppUser.ts
-var import_mongoose10 = __toESM(require("mongoose"));
-var AppUserSchema = new import_mongoose10.Schema(
+var import_mongoose11 = __toESM(require("mongoose"));
+var AppUserSchema = new import_mongoose11.Schema(
   {
     uid: { type: String, required: true, unique: true, index: true },
     email: { type: String, trim: true, lowercase: true },
@@ -2992,7 +3043,7 @@ var AppUserSchema = new import_mongoose10.Schema(
   },
   { timestamps: true }
 );
-var AppUser_default = import_mongoose10.default.model("AppUser", AppUserSchema);
+var AppUser_default = import_mongoose11.default.model("AppUser", AppUserSchema);
 
 // src/middleware/auth.ts
 var BEARER_RE = /^Bearer\s+(.+)$/i;
@@ -3081,6 +3132,7 @@ router2.delete("/cv/:cvId", requireAuth, deleteCV);
 router2.post("/chat", requireAuth, chatWithAI);
 router2.post("/opportunity-context", requireAuth, getRetrievedOpportunityContext);
 router2.post("/mentorship-complaint", requireAuth, recordMentorshipComplaint);
+router2.post("/chat-log", requireAuth, logChat);
 var aiRoutes_default = router2;
 
 // src/routes/mentorRoutes.ts
@@ -3090,8 +3142,8 @@ var import_express7 = __toESM(require("express"));
 var import_express6 = require("express");
 
 // src/models/Mentor.ts
-var import_mongoose11 = __toESM(require("mongoose"));
-var MentorSchema = new import_mongoose11.Schema(
+var import_mongoose12 = __toESM(require("mongoose"));
+var MentorSchema = new import_mongoose12.Schema(
   {
     userId: { type: String, required: true, unique: true, index: true },
     name: { type: String },
@@ -3104,7 +3156,7 @@ var MentorSchema = new import_mongoose11.Schema(
   { timestamps: true }
 );
 MentorSchema.index({ status: 1 });
-var Mentor_default = import_mongoose11.default.model("Mentor", MentorSchema);
+var Mentor_default = import_mongoose12.default.model("Mentor", MentorSchema);
 
 // src/controllers/mentorController.ts
 var MENTOR_CUT = 0.9;
@@ -3286,11 +3338,11 @@ var import_express10 = __toESM(require("express"));
 var import_express9 = require("express");
 
 // src/models/Application.ts
-var import_mongoose12 = __toESM(require("mongoose"));
-var ApplicationSchema = new import_mongoose12.Schema(
+var import_mongoose13 = __toESM(require("mongoose"));
+var ApplicationSchema = new import_mongoose13.Schema(
   {
     userId: { type: String, required: true, index: true },
-    opportunityId: { type: import_mongoose12.Schema.Types.ObjectId, ref: "Opportunity", required: true },
+    opportunityId: { type: import_mongoose13.Schema.Types.ObjectId, ref: "Opportunity", required: true },
     status: {
       type: String,
       enum: ["saved", "applied", "interview", "accepted", "rejected"],
@@ -3303,7 +3355,7 @@ var ApplicationSchema = new import_mongoose12.Schema(
   { timestamps: true }
 );
 ApplicationSchema.index({ opportunityId: 1, userId: 1 }, { unique: true });
-var Application_default = import_mongoose12.default.model("Application", ApplicationSchema);
+var Application_default = import_mongoose13.default.model("Application", ApplicationSchema);
 
 // src/controllers/applicationController.ts
 var VALID_STATUSES = ["saved", "applied", "interview", "accepted", "rejected"];
@@ -3606,7 +3658,7 @@ var import_express16 = __toESM(require("express"));
 
 // src/controllers/adminController.ts
 var import_express15 = require("express");
-var import_mongoose13 = require("mongoose");
+var import_mongoose14 = require("mongoose");
 var PLATFORM_CUT = 0.1;
 var ADMIN_LIST_LIMIT = 100;
 var ADMIN_LIST_MAX_LIMIT = 200;
@@ -3783,7 +3835,7 @@ var listComplaints = async (req, res) => {
 var resolveComplaint = async (req, res) => {
   try {
     const { id } = req.params;
-    if (!(0, import_mongoose13.isValidObjectId)(id)) {
+    if (!(0, import_mongoose14.isValidObjectId)(id)) {
       return res.status(400).json({ success: false, error: "Invalid complaint id." });
     }
     const complaint = await MentorshipComplaint_default.findByIdAndUpdate(
@@ -3798,6 +3850,34 @@ var resolveComplaint = async (req, res) => {
   } catch (error) {
     console.error("Failed to resolve complaint:", error);
     res.status(500).json({ success: false, error: "Failed to resolve complaint." });
+  }
+};
+var listChats = async (req, res) => {
+  try {
+    const { page, limit, skip } = parsePagination(req);
+    const [logs, total] = await Promise.all([
+      ChatLog_default.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      ChatLog_default.countDocuments()
+    ]);
+    res.json({
+      success: true,
+      chats: logs.map((l) => ({
+        _id: l._id,
+        userId: l.userId,
+        userEmail: l.userEmail,
+        userName: l.userName,
+        message: l.message,
+        reply: l.reply,
+        source: l.source,
+        createdAt: l.createdAt
+      })),
+      total,
+      page,
+      pages: Math.ceil(total / limit)
+    });
+  } catch (error) {
+    console.error("Failed to list chats:", error);
+    res.status(500).json({ success: false, error: "Failed to list chats." });
   }
 };
 var reviewMentorApplication = async (req, res) => {
@@ -3834,6 +3914,7 @@ router8.get("/users", listUsers);
 router8.get("/mentors", listMentors);
 router8.get("/mentees", listMentees);
 router8.get("/complaints", listComplaints);
+router8.get("/chats", listChats);
 router8.get("/launch", getAdminLaunch);
 router8.post("/launch/state", setLaunchState);
 router8.post("/launch/timer", setLaunchTimer);
@@ -3880,11 +3961,11 @@ app2.use("/api", apiLimiter);
 app2.use("/api/ai/chat", chatLimiter);
 app2.use("/api/sync", sensitiveLimiter);
 var healthHandler = (_req, res) => {
-  const dbReady = import_mongoose14.default.connection.readyState === 1;
+  const dbReady = import_mongoose15.default.connection.readyState === 1;
   res.setHeader("Cache-Control", "no-store");
   res.status(dbReady ? 200 : 503).json({
     status: dbReady ? "ok" : "degraded",
-    db: import_mongoose14.default.connection.readyState,
+    db: import_mongoose15.default.connection.readyState,
     uptime: process.uptime(),
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
@@ -3924,7 +4005,7 @@ var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitForDatabase() {
   for (let attempt = 1; attempt <= MONGO_CONNECT_RETRIES; attempt++) {
     try {
-      await import_mongoose14.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
+      await import_mongoose15.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
       return;
     } catch (error) {
       console.error(
