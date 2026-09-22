@@ -34,10 +34,10 @@ __export(index_exports, {
 });
 module.exports = __toCommonJS(index_exports);
 var import_config = require("dotenv/config");
-var import_express18 = __toESM(require("express"));
+var import_express20 = __toESM(require("express"));
 var import_compression = __toESM(require("compression"));
 var import_cors = __toESM(require("cors"));
-var import_mongoose15 = __toESM(require("mongoose"));
+var import_mongoose16 = __toESM(require("mongoose"));
 var import_node_cron = __toESM(require("node-cron"));
 var import_helmet = __toESM(require("helmet"));
 var import_multer2 = __toESM(require("multer"));
@@ -3654,7 +3654,7 @@ router7.post("/mentorship-interest", requireAuth, recordMentorshipInterest);
 var userRoutes_default = router7;
 
 // src/routes/adminRoutes.ts
-var import_express16 = __toESM(require("express"));
+var import_express17 = __toESM(require("express"));
 
 // src/controllers/adminController.ts
 var import_express15 = require("express");
@@ -3906,10 +3906,96 @@ var reviewMentorApplication = async (req, res) => {
   }
 };
 
+// src/controllers/visitsController.ts
+var import_crypto3 = require("crypto");
+var import_express16 = require("express");
+
+// src/models/PageVisit.ts
+var import_mongoose15 = __toESM(require("mongoose"));
+var PageVisitSchema = new import_mongoose15.Schema(
+  {
+    visitorKey: { type: String, required: true, index: true },
+    path: { type: String, default: "/", trim: true },
+    referrer: { type: String, default: "", trim: true },
+    userAgent: { type: String, default: "", trim: true }
+  },
+  { timestamps: true }
+);
+PageVisitSchema.index({ createdAt: -1 });
+var PageVisit_default = import_mongoose15.default.model("PageVisit", PageVisitSchema);
+
+// src/controllers/visitsController.ts
+var hashVisitorKey = (ip) => (0, import_crypto3.createHash)("sha256").update(String(ip || "unknown")).digest("hex");
+var clamp = (value, max) => String(value ?? "").slice(0, max);
+var recordVisit = async (req, res) => {
+  try {
+    const cfIp = req.headers["cf-connecting-ip"] || "";
+    const ip = cfIp || req.ip || req.socket.remoteAddress || "unknown";
+    await PageVisit_default.create({
+      visitorKey: hashVisitorKey(ip),
+      path: clamp(req.body?.path, 300) || "/",
+      referrer: clamp(req.body?.referrer, 300),
+      userAgent: clamp(req.headers["user-agent"], 300)
+    });
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to record visit:", error);
+    res.status(200).json({ success: true });
+  }
+};
+var getVisitStats = async (_req, res) => {
+  try {
+    const now = /* @__PURE__ */ new Date();
+    const startToday = new Date(now);
+    startToday.setHours(0, 0, 0, 0);
+    const start14d = new Date(startToday);
+    start14d.setDate(startToday.getDate() - 13);
+    const [totalVisits, uniqueVisitors, visitsToday, uniqueToday] = await Promise.all([
+      PageVisit_default.countDocuments(),
+      PageVisit_default.distinct("visitorKey"),
+      PageVisit_default.countDocuments({ createdAt: { $gte: startToday } }),
+      PageVisit_default.distinct("visitorKey", { createdAt: { $gte: startToday } })
+    ]);
+    const dailyRows = await PageVisit_default.aggregate([
+      { $match: { createdAt: { $gte: start14d } } },
+      {
+        $project: {
+          day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          visitorKey: 1
+        }
+      },
+      { $group: { _id: { day: "$day", visitorKey: "$visitorKey" }, visits: { $sum: 1 } } },
+      { $group: { _id: "$_id.day", visits: { $sum: "$visits" }, unique: { $sum: 1 } } },
+      { $sort: { _id: 1 } }
+    ]);
+    const byDay = new Map(dailyRows.map((r) => [r._id, { visits: r.visits, unique: r.unique }]));
+    const daily = [];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(startToday);
+      d.setDate(startToday.getDate() - (13 - i));
+      const key = d.toISOString().slice(0, 10);
+      const row = byDay.get(key);
+      daily.push({ date: key, visits: row?.visits ?? 0, unique: row?.unique ?? 0 });
+    }
+    res.json({
+      success: true,
+      totalVisits,
+      uniqueVisitors: uniqueVisitors.length,
+      visitsToday,
+      uniqueToday: uniqueToday.length,
+      daily
+    });
+  } catch (error) {
+    console.error("Failed to load visit stats:", error);
+    res.status(500).json({ success: false, error: "Failed to load visit stats." });
+  }
+};
+
 // src/routes/adminRoutes.ts
-var router8 = import_express16.default.Router();
+var router8 = import_express17.default.Router();
 router8.use(requireAdmin);
 router8.get("/overview", getOverview);
+router8.get("/visits", getVisitStats);
 router8.get("/users", listUsers);
 router8.get("/mentors", listMentors);
 router8.get("/mentees", listMentees);
@@ -3925,14 +4011,20 @@ router8.post("/complaints/:id/resolve", resolveComplaint);
 var adminRoutes_default = router8;
 
 // src/routes/launchRoutes.ts
-var import_express17 = __toESM(require("express"));
-var router9 = import_express17.default.Router();
+var import_express18 = __toESM(require("express"));
+var router9 = import_express18.default.Router();
 router9.get("/status", getLaunchStatus);
 router9.post("/waitlist", waitlistLimiter, joinWaitlist);
 var launchRoutes_default = router9;
 
+// src/routes/visitRoutes.ts
+var import_express19 = __toESM(require("express"));
+var router10 = import_express19.default.Router();
+router10.post("/", recordVisit);
+var visitRoutes_default = router10;
+
 // src/index.ts
-var app2 = (0, import_express18.default)();
+var app2 = (0, import_express20.default)();
 var port = process.env.PORT || 5e3;
 app2.set("trust proxy", 1);
 app2.use((0, import_helmet.default)());
@@ -3956,16 +4048,16 @@ app2.use(
     }
   })
 );
-app2.use(import_express18.default.json({ limit: "1mb" }));
+app2.use(import_express20.default.json({ limit: "1mb" }));
 app2.use("/api", apiLimiter);
 app2.use("/api/ai/chat", chatLimiter);
 app2.use("/api/sync", sensitiveLimiter);
 var healthHandler = (_req, res) => {
-  const dbReady = import_mongoose15.default.connection.readyState === 1;
+  const dbReady = import_mongoose16.default.connection.readyState === 1;
   res.setHeader("Cache-Control", "no-store");
   res.status(dbReady ? 200 : 503).json({
     status: dbReady ? "ok" : "degraded",
-    db: import_mongoose15.default.connection.readyState,
+    db: import_mongoose16.default.connection.readyState,
     uptime: process.uptime(),
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
@@ -3983,6 +4075,7 @@ app2.use("/api/mentorships", mentorshipRoutes_default);
 app2.use("/api/users", userRoutes_default);
 app2.use("/api/admin", adminRoutes_default);
 app2.use("/api/launch", launchRoutes_default);
+app2.use("/api/visits", visitRoutes_default);
 app2.use((err, _req, res, _next) => {
   if (err instanceof import_multer2.default.MulterError) {
     const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
@@ -4005,7 +4098,7 @@ var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitForDatabase() {
   for (let attempt = 1; attempt <= MONGO_CONNECT_RETRIES; attempt++) {
     try {
-      await import_mongoose15.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
+      await import_mongoose16.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
       return;
     } catch (error) {
       console.error(

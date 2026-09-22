@@ -17,12 +17,14 @@ import {
   setLaunchTimer,
   setWhatsappGroup,
 } from '../controllers/launchController';
+import { getVisitStats } from '../controllers/visitsController';
 
 const router = express.Router();
 
 router.use(requireAdmin);
 
 router.get('/overview', getOverview);
+router.get('/visits', getVisitStats);
 router.get('/users', listUsers);
 router.get('/mentors', listMentors);
 router.get('/mentees', listMentees);
