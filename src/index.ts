@@ -87,6 +87,7 @@ import userRoutes from './routes/userRoutes';
 import adminRoutes from './routes/adminRoutes';
 import launchRoutes from './routes/launchRoutes';
 import visitRoutes from './routes/visitRoutes';
+import themeRoutes from './routes/themeRoutes';
 
 // Load-balancer health probe (Tier 1, Item 1). The LB checks GET /healthz and
 // marks the instance ready only when BOTH hold: this handler is executing (the
@@ -123,6 +124,7 @@ app.use('/api/users', userRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/launch', launchRoutes);
 app.use('/api/visits', visitRoutes);
+app.use('/api/theme', themeRoutes);
 
 // Multer errors (file too big, wrong type) -> clean HTTP responses instead of
 // a generic 500, and shield the error message from the client.

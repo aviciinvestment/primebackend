@@ -18,10 +18,14 @@ import {
   setWhatsappGroup,
 } from '../controllers/launchController';
 import { getVisitStats } from '../controllers/visitsController';
+import { getTheme, setTheme } from '../controllers/themeController';
 
 const router = express.Router();
 
 router.use(requireAdmin);
+
+router.get('/theme', getTheme);
+router.post('/theme', setTheme);
 
 router.get('/overview', getOverview);
 router.get('/visits', getVisitStats);

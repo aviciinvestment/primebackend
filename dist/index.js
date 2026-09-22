@@ -34,10 +34,10 @@ __export(index_exports, {
 });
 module.exports = __toCommonJS(index_exports);
 var import_config = require("dotenv/config");
-var import_express20 = __toESM(require("express"));
+var import_express22 = __toESM(require("express"));
 var import_compression = __toESM(require("compression"));
 var import_cors = __toESM(require("cors"));
-var import_mongoose16 = __toESM(require("mongoose"));
+var import_mongoose17 = __toESM(require("mongoose"));
 var import_node_cron = __toESM(require("node-cron"));
 var import_helmet = __toESM(require("helmet"));
 var import_multer2 = __toESM(require("multer"));
@@ -3654,7 +3654,7 @@ router7.post("/mentorship-interest", requireAuth, recordMentorshipInterest);
 var userRoutes_default = router7;
 
 // src/routes/adminRoutes.ts
-var import_express17 = __toESM(require("express"));
+var import_express18 = __toESM(require("express"));
 
 // src/controllers/adminController.ts
 var import_express15 = require("express");
@@ -3991,9 +3991,62 @@ var getVisitStats = async (_req, res) => {
   }
 };
 
+// src/controllers/themeController.ts
+var import_express17 = require("express");
+
+// src/models/ThemeConfig.ts
+var import_mongoose16 = __toESM(require("mongoose"));
+var ThemeConfigSchema = new import_mongoose16.Schema(
+  {
+    theme: { type: String, enum: ["light", "dark", "midnight"], default: "dark" }
+  },
+  { timestamps: true }
+);
+var ThemeConfig_default = import_mongoose16.default.model("ThemeConfig", ThemeConfigSchema);
+
+// src/controllers/themeController.ts
+var VALID_THEMES = ["light", "dark", "midnight"];
+var getConfig2 = async () => {
+  let config = await ThemeConfig_default.findOne();
+  if (!config) {
+    config = await ThemeConfig_default.create({ theme: "dark" });
+  }
+  return config;
+};
+var getTheme = async (_req, res) => {
+  try {
+    const config = await getConfig2();
+    res.setHeader("Cache-Control", "public, max-age=15");
+    res.json({ success: true, theme: config.theme });
+  } catch (error) {
+    console.error("Failed to load theme:", error);
+    res.status(500).json({ success: false, error: "Failed to load theme." });
+  }
+};
+var setTheme = async (req, res) => {
+  try {
+    const raw = String(req.body?.theme ?? "");
+    if (!VALID_THEMES.includes(raw)) {
+      return res.status(400).json({
+        success: false,
+        error: "Theme must be one of: light, dark, midnight."
+      });
+    }
+    const config = await getConfig2();
+    config.theme = raw;
+    await config.save();
+    res.json({ success: true, theme: config.theme });
+  } catch (error) {
+    console.error("Failed to update theme:", error);
+    res.status(500).json({ success: false, error: "Failed to update theme." });
+  }
+};
+
 // src/routes/adminRoutes.ts
-var router8 = import_express17.default.Router();
+var router8 = import_express18.default.Router();
 router8.use(requireAdmin);
+router8.get("/theme", getTheme);
+router8.post("/theme", setTheme);
 router8.get("/overview", getOverview);
 router8.get("/visits", getVisitStats);
 router8.get("/users", listUsers);
@@ -4011,20 +4064,26 @@ router8.post("/complaints/:id/resolve", resolveComplaint);
 var adminRoutes_default = router8;
 
 // src/routes/launchRoutes.ts
-var import_express18 = __toESM(require("express"));
-var router9 = import_express18.default.Router();
+var import_express19 = __toESM(require("express"));
+var router9 = import_express19.default.Router();
 router9.get("/status", getLaunchStatus);
 router9.post("/waitlist", waitlistLimiter, joinWaitlist);
 var launchRoutes_default = router9;
 
 // src/routes/visitRoutes.ts
-var import_express19 = __toESM(require("express"));
-var router10 = import_express19.default.Router();
+var import_express20 = __toESM(require("express"));
+var router10 = import_express20.default.Router();
 router10.post("/", recordVisit);
 var visitRoutes_default = router10;
 
+// src/routes/themeRoutes.ts
+var import_express21 = __toESM(require("express"));
+var router11 = import_express21.default.Router();
+router11.get("/", getTheme);
+var themeRoutes_default = router11;
+
 // src/index.ts
-var app2 = (0, import_express20.default)();
+var app2 = (0, import_express22.default)();
 var port = process.env.PORT || 5e3;
 app2.set("trust proxy", 1);
 app2.use((0, import_helmet.default)());
@@ -4048,16 +4107,16 @@ app2.use(
     }
   })
 );
-app2.use(import_express20.default.json({ limit: "1mb" }));
+app2.use(import_express22.default.json({ limit: "1mb" }));
 app2.use("/api", apiLimiter);
 app2.use("/api/ai/chat", chatLimiter);
 app2.use("/api/sync", sensitiveLimiter);
 var healthHandler = (_req, res) => {
-  const dbReady = import_mongoose16.default.connection.readyState === 1;
+  const dbReady = import_mongoose17.default.connection.readyState === 1;
   res.setHeader("Cache-Control", "no-store");
   res.status(dbReady ? 200 : 503).json({
     status: dbReady ? "ok" : "degraded",
-    db: import_mongoose16.default.connection.readyState,
+    db: import_mongoose17.default.connection.readyState,
     uptime: process.uptime(),
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
@@ -4076,6 +4135,7 @@ app2.use("/api/users", userRoutes_default);
 app2.use("/api/admin", adminRoutes_default);
 app2.use("/api/launch", launchRoutes_default);
 app2.use("/api/visits", visitRoutes_default);
+app2.use("/api/theme", themeRoutes_default);
 app2.use((err, _req, res, _next) => {
   if (err instanceof import_multer2.default.MulterError) {
     const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
@@ -4098,7 +4158,7 @@ var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitForDatabase() {
   for (let attempt = 1; attempt <= MONGO_CONNECT_RETRIES; attempt++) {
     try {
-      await import_mongoose16.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
+      await import_mongoose17.default.connect(mongoUri, { serverSelectionTimeoutMS: 5e3 });
       return;
     } catch (error) {
       console.error(
